@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+env/
+language_model/offline-gpt2/
+language_model/local_corpus/
+language_model/localized-gpt-output/
+.ipynb_checkpoints/
+web_rag_db/

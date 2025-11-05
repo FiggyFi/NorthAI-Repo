@@ -1,0 +1,17 @@
+streamlit
+requests-cache
+python-dotenv
+chromadb
+sentence-transformers
+langchain-text-splitters
+pypdf
+python-docx
+python-pptx
+pytesseract
+Pillow
+striprtf
+trafilatura
+torch
+duckduckgo-search
+pandas
+ollama
