@@ -21,15 +21,16 @@ def check_chroma_path():
     except Exception as e:
         return False, f"ChromaDB path not writable: {db} ({e})"
 
-def check_airgap_env():
-    air = os.getenv("AIRPLANE_MODE", "1")
-    return air in ("1", "true", "True"), "Set AIRPLANE_MODE=1 in your .env for offline default."
+def report_airgap_env():
+    air = str(os.getenv("OFFLINE_MODE", "1")).strip().lower()
+    msg = f"OFFLINE_MODE={air} (toggle in UI overrides at runtime)"
+    return True, msg
 
 def health_summary():
     checks = [
         ("Embedding model", *check_model_dir()),
         ("Chroma path", *check_chroma_path()),
-        ("Airplane mode default", *check_airgap_env()),
+        ("offline mode setting", *report_airgap_env()),  # <-- non-blocking
     ]
     ok = all(c[1] for c in checks)
     lines = []

@@ -10,10 +10,23 @@ and asserts prerequisites before serving the app.
 from typing import Optional, Tuple
 
 # Local modules
+
+# Retrieval Pipeline
+from retrieval.retrieval_router import search_everything
+from retrieval.privacy import privacy_expand_query, make_outbound_filter_fn
+from retrieval.common import AppConfig, RetrievalManager
+from retrieval.common import set_offline_mode, is_offline_mode
+from retrieval.connectors import fetch_page_text
+from dataclasses import dataclass
+from retrieval.connectors import search_duckduckgo, wikipedia_search
+
+# Profiles & Session Management
 from profiles import (
     load_profile, save_profile, list_profiles,
     load_sessions, save_sessions
 )
+
+# Vector Store (Document Management)
 from vector_store import (
     COLL_LOCAL,
     COLL_WEB,
@@ -21,15 +34,24 @@ from vector_store import (
     add_documents,
     get_or_create_collection, 
     retrieve_local_then_web,
+    get_session_db_path,  # ← NEW
+    get_embedder,
+    delete_collection_for_session,
+    get_session_id,
 )
 
-from retrieval.router import search_everything
-from retrieval.privacy import privacy_expand_query, make_outbound_filter_fn
-from retrieval.common import AppConfig, RetrievalManager
-from retrieval.common import set_airplane_mode, is_airplane_mode
-from retrieval.connectors import fetch_page_text
+# ChromaDB imports for clear documents functionality
+import chromadb  # ← NEW
+from chromadb.config import Settings  # ← NEW
 
+# App Bootstrap
 from app_bootstrap import assert_prereqs_or_raise, snapshot_items
+
+# Task Router and Specialists
+from task_router import classify_intent, strip_command_from_text, TaskIntent
+from specialists import specialist_prompts
+from specialists import proofreader
+from specialists import email_drafter
 
 # Standard 
 import os
@@ -43,19 +65,17 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 # Third-party packages
+import streamlit as st
 from dotenv import load_dotenv
+
+# Env Set-up
 ROOT = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=ROOT / ".env")
-
-import streamlit as st
 
 try:
     import ollama  
 except Exception:
     ollama = None
-
-from vector_store import get_embedder 
-from vector_store import delete_collection_for_session
 
 # Fail fast on startup
 assert_prereqs_or_raise()
@@ -63,14 +83,41 @@ assert_prereqs_or_raise()
 # Create the config object once for the whole app
 config = AppConfig()
 
-import streamlit as st
-from vector_store import get_session_id
 
 #Constants
 APP_TITLE = "NorthAI"
 MODEL_GEN = "llama3:8b"
-MAX_CHAT_TURNS = 20
+MAX_CHAT_TURNS = 50
 DEFAULT_PROMPT = "How can I help you today?"
+
+# Context window for follow-up requests (number of recent messages to include)
+FOLLOWUP_CONTEXT_MESSAGES = 8  # Last 4 exchanges
+
+# Refinement detection thresholds
+MAX_FOLLOWUP_WORDS = 20
+VERY_SHORT_FOLLOWUP_THRESHOLD = 10  # Very short queries are almost always follow-ups
+
+# Refinement keywords (organized by category for maintainability)
+REFINEMENT_KEYWORDS = {
+    # Style & tone
+    "more professional", "more technical", "more casual", "more formal",
+    "sound more", "make it sound", "change the tone",
+    # Length
+    "more concise", "shorter", "longer", "tighter", "brief",
+    "verbose", "condense", "expand", "not verbose", "do not be verbose",
+    # Quality
+    "better", "clearer", "simpler", "improve", "refine", "polish",
+    # Actions
+    "fix", "adjust", "revise", "rewrite", "tweak",
+}
+
+IMPERATIVE_VERBS = {
+    "make", "change", "fix", "adjust", "rewrite", "sound",
+    "add", "remove", "use", "avoid", "keep", "drop"
+}
+
+# Immediately sync runtime offline mode for connectors/common
+set_offline_mode(bool(st.session_state.get("offline_mode", False)))
 
 @st.cache_resource
 def preload_models():
@@ -96,6 +143,20 @@ def preload_models():
 with st.spinner("Warming up the AI engines... This may take a moment."):
     preload_models()
 
+STRICT_RAG_SYSTEM_PROMPT = """You are a retrieval-only assistant.
+Answer ONLY using the provided CONTEXT.
+- Add a citation tag [L#] or [W#] immediately after each factual claim you make.
+- If the CONTEXT does not contain the answer, reply exactly with:
+  "I don't have enough evidence in the provided sources."
+- Be concise. Do not add a 'References' section. Never invent facts or citations.
+"""
+
+def _has_sufficient_evidence(context: Optional[str], *_args, **_kwargs) -> bool:
+    """
+    Permit answering whenever CONTEXT has content.
+    Accepts extra args to be call-site compatible (prevents TypeError).
+    """
+    return bool(context and context.strip())
 
 # Retrieval settings
 NUM_CTX_KEEP   = 16 # keep best 16 chunks after embeddings ranking
@@ -135,101 +196,42 @@ def parse_year_filters(q: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
 
     return (None, None)
 
-# Generation (drop-in replacement)
+# Generation
 def stream_answer(messages: list[dict], context: str | None):
     if ollama is None:
         yield "**Error:** Ollama Python client not installed. Run `pip install ollama` in your venv."
         return
 
-    # Mode-aware system instructions
     base = (
-        "You are a helpful, conversational assistant. "
-        "You MUST ground your answer *only* in the provided CONTEXT. "
-        "You MUST cite *every* factual claim using the bracketed tags (e.g., [L1], [W2]) found in the CONTEXT. "
-        "Use Canadian English spelling. "
+        "You are a retrieval-only assistant. "
+        "Answer ONLY from the provided CONTEXT. "
+        "Add [L#] or [W#] after each factual claim. "
+        "If the answer is not in CONTEXT, reply: "
+        "\"I don't have enough evidence in the provided sources.\" "
+        "Be concise; no 'References' section."
     )
-    use_web = not is_airplane_mode()
-    
-    # Stricter rules to prevent hallucination
-    if use_web:
-        mode = (
-            "Ground your answer PRIMARILY in LOCAL (L#) context. "
-            "Use WEB (W#) to supplement. "
-            "NEVER invent information. "
-            "NEVER invent citations. "
-            "If the CONTEXT does not contain the answer, state that the provided documents do not have the information. "
-            "DO NOT add a 'References' section at the end; that is handled separately."
-        )
-    else:
-        mode = (
-            "You are in offline mode. "
-            "Use only LOCAL (L#) context. "
-            "NEVER invent information or citations. "
-            "If the CONTEXT is missing the answer, say so. "
-            "DO NOT add a 'References' section at the end; that is handled separately."
-        )
+    use_web = not is_offline_mode()
+    mode = "You may cite [L#] and [W#]." if use_web else "Cite only [L#]."
 
-    # Depth directive (adds structure/length, no loss of prior context)
-    depth = st.session_state.get("answer_depth", "Comprehensive")
-    if depth == "Concise":
-        depth_directive = (
-            "Write a crisp answer with 5–8 bullet points and a short paragraph. "
-            "Always include citations [L#/W#] after each claim."
-        )
-        min_words = 180
-    elif depth == "Standard":
-        depth_directive = (
-            "Write a structured answer with headings and paragraphs. "
-            "Include a short summary, key findings, and next steps. "
-            "Cite [L#/W#] after each factual claim; include brief quotes when useful."
-        )
-        min_words = 400
-    else:  # Comprehensive
-        depth_directive = (
-            "Write a thorough report with these sections: "
-            "1) Executive Summary, 2) Detailed Findings (grouped by theme), "
-            "3) Evidence with short quoted excerpts (with [L#/W#] after each), "
-            "4) Data/Calculations or Tables when present, "
-            "5) Uncertainties & Gaps, 6) Actionable Next Steps. "
-            "Prefer LOCAL sources; include citations after each paragraph."
-        )
-        min_words = 900
+    depth = st.session_state.get("answer_depth", "Concise")
+    style = "Keep it brief." if depth == "Concise" else "Be structured but concise."
 
-    sys = base + mode + " " + depth_directive
-    enriched = [{"role": "system", "content": sys}]
-
-    pf = st.session_state.profile
-    facts = pf.get("facts", [])
-    facts_text = "\n".join(f"- {f.get('text','')}" for f in facts[:10])
-    if facts_text.strip():
-        enriched.append({"role": "system", "content": "Remember these about the user:\n" + facts_text})
-    if pf.get("identity"):
-        enriched.append({"role": "system", "content": "User identity:\n" + "\n".join(f"- {k}: {v}" for k, v in pf["identity"].items())})
-    if pf.get("preferences"):
-        enriched.append({"role": "system", "content": "User preferences:\n" + "\n".join(f"- {k}: {v}" for k, v in pf["preferences"].items())})
-    if st.session_state.get("chat_summary"):
-        enriched.append({"role": "system", "content": f"Conversation summary:\n{st.session_state.chat_summary}"})
+    messages_built = [
+        {"role": "system", "content": f"{base}\n{mode}\n{style}"},
+    ]
     if context:
-        enriched.append({"role": "user", "content": f"Context:\n{context}"})
-    enriched.extend(messages)
+        messages_built.append({"role": "user", "content": f"CONTEXT:\n{context}"})
+    messages_built.extend(messages)
 
-    # Model options: allow long, fuller answers
     opts = {
-        "num_predict": int(st.session_state.get("answer_max_tokens", 2048)),
-        "temperature": 0.3,
+        "num_predict": int(st.session_state.get("answer_max_tokens", 1024)),
+        "temperature": 0.15,
+        "top_p": 0.9,
     }
 
-    # Stricter nudge to reinforce the rules
-    user_tail = (
-        f"\n\nWrite at least {min_words} words (as needed by content). "
-        f"REMEMBER: Base *all* statements on the CONTEXT and cite [L#/W#] after each claim. "
-        f"Do NOT answer from your own knowledge. Do NOT invent links or references."
-    )
-
-    # Stream with tail appended to last message
-    last = enriched[-1]
-    mutated_last = {**last, "content": last["content"] + user_tail} if "content" in last else last
-    stream = ollama.chat(model=MODEL_GEN, stream=True, messages=[*enriched[:-1], mutated_last], options=opts)
+    last = messages_built[-1]
+    last = {**last, "content": last["content"] + "\n\nAnswer only from CONTEXT; cite [L#/W#]."}
+    stream = ollama.chat(model=MODEL_GEN, stream=True, messages=[*messages_built[:-1], last], options=opts)
 
     for chunk in stream:
         if not chunk.get("done"):
@@ -457,8 +459,122 @@ def display_name_from_profile(p: dict) -> str:
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
+# NorthBridge visual styling
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Helvetica+Neue&display=swap');
 
-st.title("NorthAI")
+    html, body, [class*="css"] {
+        font-family: 'Helvetica Neue', 'Century Gothic', sans-serif;
+    }
+    h1, h2, h3 {
+        color: #0B3862;
+        font-family: 'Century Gothic', sans-serif;
+        font-weight: 600;
+    }
+
+    /* Buttons: outlined by default, fill red on hover with white text */
+    .stButton > button {
+        background-color: #FFFFFF !important;
+        color: #832334 !important;
+        border: 2px solid #832334 !important;
+        border-radius: 8px;
+        height: 2.5em;
+        width: 100%;
+        font-weight: 600;
+        transition: all 0.2s ease-in-out;
+    }
+
+    /* The inner label span also needs its color set */
+    .stButton > button span {
+        color: #832334 !important;
+    }
+
+    /* Hover: fill red + white text (button and its span) */
+    .stButton > button:not(:disabled):hover {
+        background-color: #832334 !important;
+        border-color: #832334 !important;
+    }
+    .stButton > button:not(:disabled):hover span {
+        color: #FFFFFF !important;
+    }
+
+    /* Cover the 'primary' kind too (Streamlit sometimes uses it) */
+    .stButton > button[kind="primary"] {
+        background-color: #FFFFFF !important;
+        color: #832334 !important;
+        border: 2px solid #832334 !important;
+    }
+    .stButton > button[kind="primary"]:not(:disabled):hover {
+        background-color: #832334 !important;
+        border-color: #832334 !important;
+    }
+    .stButton > button[kind="primary"]:not(:disabled):hover span {
+        color: #FFFFFF !important;
+    }
+
+
+
+    /* --- Sidebar styling --- */
+    section[data-testid="stSidebar"] {
+        background-color: #F2F1EF;
+        border-right: 1px solid #DAD9D7;
+        padding-top: 1rem;
+    }
+
+    /* Sidebar headers and captions */
+    section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 {
+        color: #0B3862;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+    }
+    section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] label {
+        color: #333333;
+    }
+
+    /* --- Top header bar --- */
+    .app-topbar {
+        background-color: #0B3862;
+        color: white;
+        padding: 0.6em 1em;
+        margin: -1em -1em 1em -1em;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-radius: 0;
+    }
+    .app-topbar h3 {
+        margin: 0;
+        color: white;
+        font-weight: 600;
+    }
+
+    /* --- Message cards --- */
+    .chat-bubble {
+        background-color: #FFFFFF;
+        border-radius: 8px;
+        padding: 10px 15px;
+        margin: 8px 0;
+        border: 1px solid #E1E0DF;
+    }
+
+    /* --- Divider and spacing tweaks --- */
+    hr {
+        border: none;
+        border-top: 1px solid #E0E0E0;
+        margin: 0.8em 0;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="app-topbar">
+  <h3>NorthAI</h3>
+  <div style="font-size:0.9em;opacity:0.85;"></div>
+</div>
+""", unsafe_allow_html=True)
+
+
 
 
 # Chat session utilities
@@ -573,18 +689,19 @@ if "memory" not in st.session_state:
 
 # Depth + token controls defaults
 if "answer_depth" not in st.session_state:
-    st.session_state.answer_depth = "Comprehensive"
+    st.session_state.answer_depth = "Concise"
 if "answer_max_tokens" not in st.session_state:
-    st.session_state.answer_max_tokens = 2048
+    st.session_state.answer_max_tokens = 1024
 
 
 # Top bar controls 
 col1, col2 = st.columns([0.85, 0.15])
 with col2:
-    st.toggle("✈️ Airplane Mode", key="airplane_mode", help="Offline only: disables web search.")
+    st.toggle("Offline Mode", key="offline_mode", help="Offline only: disables web search.")
+# Derive web search flag from toggle
+use_web = not st.session_state.get("offline_mode", False)
+print(f"[Debug] Offline Mode: {st.session_state.get('offline_mode', False)} | use_web = {use_web}")
 
-# Immediately sync runtime airplane mode for connectors/common
-set_airplane_mode(bool(st.session_state.get("airplane_mode", False)))
 
 # Sidebar
 with st.sidebar:
@@ -601,9 +718,6 @@ with st.sidebar:
         if st.button("🧠 Manage memory"):
             show_memory_dialog()
 
-    
-    
-    
     st.markdown("---")
 
     st.subheader("Answer style")
@@ -615,7 +729,7 @@ with st.sidebar:
     )
 
     st.session_state.answer_max_tokens = st.slider(
-        "Max tokens to generate",
+        "Response length limit (in tokens)",
         min_value=256, max_value=4096, value=st.session_state.answer_max_tokens, step=256,
         help="Controls how detailed the assistant must be. Concise, Standard, and Comprehensive modes retrieve the most relevant text chunks, providing progressively detailed answers based on that limited context. Full Summary will read all local files and summarize each one individually. This will provide the most complete synthesis, but will run significantly slow. It is advised to use Comprehensive for specific questions, queries, or requests, and Full Summary for broad, in-depth analysis for a first review of uploaded materials."
     )
@@ -651,10 +765,61 @@ with st.sidebar:
     if uploads:
         if len(uploads) > 10:
             st.warning(f"You selected {len(uploads)} files. Only the first 10 will be indexed.")
-        added = ingest_uploaded(uploads[:10])
-        st.success(f"Indexed {added} file(s) into the local vector store.")
+        
+        with st.spinner("Processing files..."):
+            added = ingest_uploaded(uploads[:10])
+        
+        if added == len(uploads[:10]):
+            st.success(f"✅ Successfully indexed all {added} file(s).")
+        elif added > 0:
+            st.warning(f"⚠️ Indexed {added} of {len(uploads[:10])} files. Some may have failed.")
+        else:
+            st.error(f"❌ Failed to index any files. Check file formats.")
+        
+        # Optional: Show which files are now loaded
+        with st.expander("📁 View loaded files"):
+            try:
+                lcoll = get_or_create_collection(COLL_LOCAL)
+                all_docs = lcoll.get(include=["metadatas"])
+                sources = sorted(set(
+                    md.get('source', '').replace('upload://', '') 
+                    for md in all_docs.get('metadatas', []) 
+                    if md.get('source')
+                ))
+                for src in sources:
+                    st.caption(f"📄 {src}")
+            except:
+                st.caption("Could not retrieve file list.")
 
     st.markdown("---")
+
+    # Show file count
+    try:
+        lcoll = get_or_create_collection(COLL_LOCAL)
+        file_count = len(set(
+            md.get('source', '') 
+            for md in lcoll.get(include=["metadatas"]).get('metadatas', [])
+            if md.get('source')
+        ))
+        if file_count > 0:
+            st.caption(f"📊 {file_count} document(s) currently loaded")
+            
+            if st.button("🗑️ Clear all documents", help="Remove all uploaded files from this session"):
+                try:
+                    # Delete and recreate the collection
+                    client = chromadb.PersistentClient(
+                        path=str(get_session_db_path(st.session_state.current_session)),
+                        settings=Settings(anonymized_telemetry=False)
+                    )
+                    client.delete_collection(COLL_LOCAL)
+                    client.get_or_create_collection(COLL_LOCAL)
+                    st.success("✅ All documents cleared.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to clear documents: {e}")
+    except:
+        pass
+    
 
     # Agents (coming soon)
     st.caption("Agents (coming soon)")
@@ -666,7 +831,7 @@ with st.sidebar:
     st.subheader("Chats")
 
     # Add new chat button
-    if st.button("➕ New Chat", use_container_width=True):
+    if st.button("New Chat", use_container_width=True):
         create_new_session(title="Untitled")
 
     # SAFE snapshot to avoid "dictionary changed size during iteration"
@@ -793,7 +958,7 @@ def build_references_by_tags(response_text: str, pairs: list[tuple[str, str, str
         return ""
 
     # Collapse duplicates by source, keep the *lowest* tag for that source
-    # We'll maintain insertion order with a dict
+    # Maintains insertion order with a dict
     by_src: dict[str, str] = {}
     for _doc, src, tag in pairs:
         tag = tag.replace(" ", "")
@@ -803,7 +968,7 @@ def build_references_by_tags(response_text: str, pairs: list[tuple[str, str, str
         if src not in by_src:
             by_src[src] = tag
         else:
-            # choose lower numeric index for stability
+            # chooses lower numeric index for stability
             old = by_src[src]
             if old[0] == tag[0]:  # same L/W
                 try:
@@ -812,7 +977,7 @@ def build_references_by_tags(response_text: str, pairs: list[tuple[str, str, str
                 except Exception:
                     pass
 
-    # Now split offline vs online and render
+    # Split offline vs online sources and render
     offline_lines, online_lines = [], []
     for src, tag in by_src.items():
         if src and src.startswith("http"):
@@ -830,7 +995,11 @@ def build_references_by_tags(response_text: str, pairs: list[tuple[str, str, str
 
     return "\n\n".join(blocks)
 
-# Chat turn 
+
+
+# Chat turn logic - with task router
+# 1. Retrieval Phase
+
 if prompt := st.chat_input("Message"):
     # Record user message
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -838,8 +1007,8 @@ if prompt := st.chat_input("Message"):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # --- Generate title only for the first message of a new chat ---
-    use_web = not is_airplane_mode()
+    # Generate title only for the first message of a new chat
+    use_web = not is_offline_mode()
     cur = st.session_state.current_session
     if (
         not st.session_state.sessions[cur].get("title")
@@ -862,6 +1031,7 @@ if prompt := st.chat_input("Message"):
         except Exception:
             topic = first_msg[:30] + ("..." if len(first_msg) > 30 else "")
         st.session_state.sessions[cur]["title"] = topic
+        
     # Create Manager at the START of the turn
     try: 
         my_session_id = st.session_state.current_session
@@ -884,277 +1054,560 @@ if prompt := st.chat_input("Message"):
         # Stop processing if the manager can't be created
         st.stop()
 
-# 1. Retrieval Phase
-    context, pairs = "", []
-    # Query the LLM to determine if it needs to search.
-    needs_search = decide_if_search_is_needed(prompt)
-    
-    if needs_search:
-        is_full_summary = st.session_state.answer_depth == "Full Summary (Slow)"
+   # Task Routing and Specialist Dispatch
 
-        if is_full_summary:
-            with st.spinner("Starting full summary... This may take several minutes."):
-                try:
-                    # 1. Get all unique file sources from the vector store
-                    lcoll = get_or_create_collection(COLL_LOCAL)
-                    all_docs = lcoll.get(include=["metadatas"])
-                    all_sources = sorted(list(set(
-                        md['source'] for md in all_docs['metadatas'] if md.get('source')
-                    )))
-                    
-                    if not all_sources:
-                        st.warning("No local files found to summarize.")
+
+    # Initialize last_intent if it doesn't exist
+    if "last_intent" not in st.session_state:
+        st.session_state.last_intent = None
+    
+    # 1. Classify the user's intent
+    intent = classify_intent(prompt)
+    
+    # 2. Detect follow-up refinement requests
+    def is_followup_refinement(user_prompt: str, previous_intent: Optional[TaskIntent]) -> bool:
+        """
+        Detects if a query is a follow-up refinement request for text manipulation tasks.
+        
+        Uses multiple signals:
+        - Explicit refinement keywords
+        - Short imperative commands
+        - Contextual continuation patterns
+        
+        Returns:
+            bool: True if this appears to be a follow-up refinement
+        """
+        if previous_intent not in [TaskIntent.PROOFREAD, TaskIntent.ELABORATE, TaskIntent.SUMMARIZE]:
+            return False
+        
+        prompt_lower = user_prompt.lower().strip()
+        word_count = len(user_prompt.strip().split())
+        
+        # Signal 1: Explicit refinement keywords (high confidence)
+        if any(keyword in prompt_lower for keyword in REFINEMENT_KEYWORDS):
+            return True
+        
+        # Signal 2: Short imperative commands (medium confidence)
+        first_word = user_prompt.strip().split()[0].lower() if user_prompt.strip() else ""
+        if word_count <= MAX_FOLLOWUP_WORDS and first_word in IMPERATIVE_VERBS:
+            return True
+        
+        # Signal 3: Very short queries (likely continuation)
+        if word_count <= VERY_SHORT_FOLLOWUP_THRESHOLD:
+            return True
+        
+        return False
+
+    # Apply follow-up detection
+    if intent == TaskIntent.SEARCH_QUERY:
+        if is_followup_refinement(prompt, st.session_state.last_intent):
+            intent = st.session_state.last_intent
+            print(f"[ROUTING] Follow-up detected: reusing {intent.name}")
+    
+    # 3. Get the clean text to operate on
+    specialist_text = strip_command_from_text(prompt)
+
+    # 4. Define the specialist LLM call function with conversational memory
+    def specialist_llm_call(system_prompt: str, user_text: str) -> str:
+        """
+        A non-streaming, blocking LLM call for specialist tasks.
+        Now includes conversational memory for follow-up refinements.
+        """
+        if ollama is None:
+            return "Error: Ollama client not installed."
+        
+        try:
+            # Start with system prompt
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Add recent conversation history for follow-up requests
+            # Check if this is a follow-up (same intent as previous turn)
+            current_intent = intent  # Capture the intent from outer scope
+            is_followup = (current_intent == st.session_state.get("last_intent"))
+            
+            if is_followup and len(st.session_state.messages) > 0:
+                # Include recent conversation context for iterative refinement
+                recent_history = st.session_state.messages[-FOLLOWUP_CONTEXT_MESSAGES:]
+                
+                for msg in recent_history:
+                    # Skip system messages (summaries)
+                    if msg["role"] != "system":
+                        messages.append({"role": msg["role"], "content": msg["content"]})
+                
+                print(f"[specialist_llm_call] Follow-up detected, added {len([m for m in recent_history if m['role'] != 'system'])} history messages")
+            
+            # Add the current user request
+            messages.append({"role": "user", "content": user_text})
+            
+            # Use standard options, but not streaming
+            opts = {
+                "num_predict": int(st.session_state.get("answer_max_tokens", 2048)),
+                "temperature": 0.3,
+            }
+            
+            response = ollama.chat(
+                model=MODEL_GEN,
+                messages=messages,
+                options=opts,
+                stream=False
+            )
+            
+            return response['message']['content'].strip()
+        
+        except Exception as e:
+            # Log with context for debugging
+            print(f"[SPECIALIST] Error in {current_intent.name}: {type(e).__name__}: {e}")
+            return "Sorry, I encountered an error while processing your request."
+
+    # 5. Initialise variables for the turn
+    answer_text = ""
+    context = ""
+    pairs = []
+    
+    # 6. Dispatch to the correct handler
+    try:
+        # Branch 1: Default search and RAG
+        if intent == TaskIntent.SEARCH_QUERY:
+            is_full_summary = st.session_state.answer_depth == "Full Summary (Slow)"
+
+            if is_full_summary:
+                with st.spinner("Starting full summary... This may take several minutes."):
+                    try:
+                        # 1. Get all unique file sources from the vector store
+                        lcoll = get_or_create_collection(COLL_LOCAL)
+                        all_docs = lcoll.get(include=["metadatas"])
+                        all_sources = sorted(list(set(
+                            md["source"] for md in all_docs["metadatas"] if md.get("source")
+                        )))
+
+                        if not all_sources:
+                            st.warning("No local files found to summarise.")
+                            st.stop()
+
+                        file_summaries = []
+                        all_pairs = []
+
+                        # 2. Mapping Step: Loop over each file and summarise it
+                        for source_name in all_sources:
+                            st.status(f"Summarizing {source_name}...")
+
+                            summary_prompt = (
+                                f"What are the main topics, key points, and conclusions of "
+                                f"the document '{source_name}'?"
+                            )
+
+                            file_ctx, file_pairs = retrieve_local_then_web(
+                                summary_prompt,
+                                top_k_local=NUM_CTX_KEEP,
+                                top_k_web=0,
+                                source_filter=source_name,
+                            )
+
+                            if not file_ctx:
+                                continue
+
+                            # 3. Summarize the retrieved text
+                            summary_resp = ollama.chat(
+                                model=MODEL_GEN,
+                                messages=[
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "You are a summarizing assistant. Summarize the "
+                                            "key points of the following context. Do not add "
+                                            "any preamble or your own opinions. Be factual and concise."
+                                        ),
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": f"Context:\n{file_ctx}\n\nSummary of {source_name}:",
+                                    },
+                                ],
+                                stream=False,
+                            )
+                            file_summary = summary_resp["message"]["content"]
+                            file_summaries.append(f"Summary for {source_name}:\n{file_summary}")
+                            all_pairs.extend(file_pairs)
+
+                        # 4. Combine all file summaries
+                        if not file_summaries:
+                            context = "No relevant information found in local files to summarize."
+                        else:
+                            context = "\n\n---\n\n".join(file_summaries)
+                        pairs = all_pairs
+
+                    except Exception as e:
+                        st.error(f"Error during full summary: {e}")
                         st.stop()
 
-                    file_summaries = []
-                    all_pairs = []
-                    
-                    # 2. Mapping Step: Loop over each file and summarize it
-                    for source_name in all_sources:
-                        st.status(f"Summarizing {source_name}...")
-                        
-                        # a. Create a generic prompt to get key chunks for summarization
-                        summary_prompt = f"What are the main topics, key points, and conclusions of the document '{source_name}'?"
-                        
-                        # b. Retrieve chunks *only* from that file
-                        file_ctx, file_pairs = retrieve_local_then_web(
-                            summary_prompt,
-                            top_k_local=NUM_CTX_KEEP, # Use 16 chunks
-                            top_k_web=0,
-                            source_filter=source_name 
-                        )
-                        
-                        if not file_ctx:
-                            continue # Skip empty files or files with no matching chunks
+            else:
+                # Standard RAG branch
+                ctx_local, pairs_local = retrieve_local_then_web(
+                    prompt,
+                    top_k_local=NUM_CTX_KEEP,
+                    top_k_web=0,
+                )
+                context = ctx_local
+                pairs = list(pairs_local)
 
-                        # c. Call Ollama to summarize *just those chunks*
-                        summary_resp = ollama.chat(
-                            model=MODEL_GEN,
-                            messages=[
-                                {"role": "system", "content": "You are a summarizing assistant. Summarize the key points of the following context. Do not add any preamble or your own opinions. Be factual and concise."},
-                                {"role": "user", "content": f"Context:\n{file_ctx}\n\nSummary of {source_name}:"}
-                            ],
-                            stream=False
-                        )
-                        file_summary = summary_resp['message']['content']
-                        file_summaries.append(f"Summary for {source_name}:\n{file_summary}")
-                        all_pairs.extend(file_pairs) # Collect all pairs for citation
+                # Precompute filters before calling search functions
+                safe_query = privacy_expand_query(prompt)
+                year_min, year_max = parse_year_filters(prompt)
+                if st.session_state.get("enable_years", False):
+                    if "year_min" in st.session_state:
+                        year_min = int(st.session_state.year_min)
+                    if "year_max" in st.session_state:
+                        year_max = int(st.session_state.year_max)
+                if year_min is not None and year_max is not None and year_min > year_max:
+                    year_min, year_max = year_max, year_min
 
-                    # 3. "Reduce" Step: Combine all summaries into the final context
-                    if not file_summaries:
-                        context = "No relevant information found in local files to summarize."
+                # Gather local docs for outbound privacy filter
+                try:
+                    lcoll = get_or_create_collection(COLL_LOCAL)
+                    peek = lcoll.peek(500) or {}
+                    local_docs_seed: list[str] = []
+                    for docs in (peek.get("documents") or []):
+                        local_docs_seed.extend(docs)
+                except Exception:
+                    local_docs_seed = []
+
+                # Optionally, retrieve from the web if not in offline mode
+                if use_web:
+                    is_academic_query = any(keyword in prompt.lower() for keyword in [
+                        "research", "study", "paper", "journal", "article", "published",
+                        "doi", "arxiv", "pubmed", "citation", "literature", "scholar",
+                        "peer review", "findings", "methodology",
+                    ])
+
+                    results = []  # Initialize once for both branches
+
+                    if is_academic_query:
+                        print(f"[App] Academic query detected: {prompt[:50]}...")
+                        from retrieval.retrieval_router import search_academic
+                        try:
+                            academic_results = search_academic(
+                                manager,
+                                safe_query,
+                                year_min=year_min,
+                                year_max=year_max,
+                            ) or []
+
+                            with st.status(f"🎓 Found {len(academic_results)} academic sources", state="complete"):
+                                if academic_results:
+                                    for i, paper in enumerate(academic_results[:5], 1):
+                                        title = paper.get("title", "Untitled")[:70]
+                                        source = paper.get("source", "unknown")
+                                        st.caption(f"{i}. [{source}] {title}")
+                                else:
+                                    st.caption("No results from academic databases")
+
+                            # Guaranteed enrichment (cannot fail)
+                            url_to_chunks = {}
+                            for rec in academic_results:
+                                title = rec.get("title") or ""
+                                authors = rec.get("authors") or []
+                                published = rec.get("published") or ""
+                                abstract = rec.get("abstract") or ""
+                                doi = rec.get("doi") or ""
+                                url = rec.get("url") or (f"doi:{doi}" if doi else "unknown-source")
+
+                                parts = []
+                                if title:
+                                    parts.append(f"**Title:** {title}")
+                                if authors:
+                                    a = ", ".join(authors[:5])
+                                    if len(authors) > 5:
+                                        a += " et al."
+                                    parts.append(f"**Authors:** {a}")
+                                if published:
+                                    parts.append(f"**Published:** {published}")
+                                if abstract:
+                                    parts.append(f"**Abstract:** {abstract}")
+                                if doi:
+                                    parts.append(f"**DOI:** {doi}")
+
+                                text = "\n".join(parts).strip()
+                                if text:
+                                    url_to_chunks[url] = [text]
+
+                            if url_to_chunks:
+                                add_documents(url_to_chunks, target=COLL_WEB)
+                                print(f"[App] Added {len(url_to_chunks)} academic papers")
+
+                            results = academic_results or search_everything(
+                                manager,
+                                safe_query,
+                                year_min=year_min,
+                                year_max=year_max,
+                            )
+
+                        except Exception as e:
+                            print(f"[App] Academic search exception ignored: {e}")
+                            results = search_everything(
+                                manager,
+                                safe_query,
+                                year_min=year_min,
+                                year_max=year_max,
+                            )
+
                     else:
-                        context = "\n\n---\n\n".join(file_summaries)
-                    pairs = all_pairs
+                        # General web search
+                        results = search_everything(manager, safe_query, year_min=year_min, year_max=year_max)
 
-                except Exception as e:
-                    st.error(f"Error during full summary: {e}")
-                    st.stop()
+                    # Post-search enrichment (safe path)
+                    with st.spinner("Searching web & enriching context..."):
+                        try:
+                            if local_docs_seed:
+                                manager.set_outbound_filter(make_outbound_filter_fn(local_docs_seed))
+                            else:
+                                manager.set_outbound_filter(None)
+
+                            if not results:
+                                results = search_everything(manager, safe_query, year_min=year_min, year_max=year_max)
+
+                            if not results:
+                                try:
+                                    from retrieval.connectors import wikipedia_search
+                                    wiki_results = wikipedia_search(manager, safe_query)
+                                    if isinstance(wiki_results, list):
+                                        results = wiki_results[:3]
+                                except Exception as e:
+                                    print(f"[fallback] Wiki error ignored: {e}")
+
+                            url_to_chunks = {}
+                            for rec in results:
+                                meta_bits = [rec.get("title"), rec.get("abstract"), rec.get("url")]
+                                fallback_text = "\n\n".join([x for x in meta_bits if x])
+
+                                try:
+                                    body = fetch_page_text(manager, rec.get("url", "")) or ""
+                                except Exception:
+                                    body = ""
+
+                                text = (body or fallback_text).strip()
+                                if text:
+                                    url_to_chunks.setdefault(rec.get("url", 'unknown-source'), []).append(text)
+
+                            if not url_to_chunks:
+                                try:
+                                    ddg = search_duckduckgo(manager, safe_query, k=6) or []
+                                    for rec in ddg:
+                                        meta_bits = [rec.get("title"), rec.get("abstract"), rec.get("url")]
+                                        text = "\n\n".join([x for x in meta_bits if x]).strip()
+                                        if text:
+                                            url_to_chunks.setdefault(rec.get("url", 'unknown-source'), []).append(text)
+                                except Exception as e:
+                                    print(f"[fallback] DDG error ignored: {e}")
+
+                            if url_to_chunks:
+                                add_documents(url_to_chunks, target=COLL_WEB)
+
+                            ctx_mixed, pairs_mixed = retrieve_local_then_web(
+                                prompt,
+                                top_k_local=0,
+                                top_k_web=max(1, NUM_CTX_KEEP // 2),
+                            )
+                            if ctx_mixed:
+                                context = (context + ("\n\n---\n\n" if context else "") + ctx_mixed).strip()
+                                pairs.extend(pairs_mixed)
+
+                            with st.status("Retrieval debug", state="complete"):
+                                st.caption(
+                                    f"web_results={len(results)}, added_urls={len(url_to_chunks)}, ctx_chars={len(context or '')}"
+                                )
+
+                        except Exception as e:
+                            print(f"[App] Post-search enrichment exception ignored: {e}")
+                            pass
+
+                        # 5. For academic queries with missing sources, return factual fallback (no hallucination)
+                        if is_academic_query and (not context or not pairs):
+                            with st.chat_message("assistant"):
+                                st.markdown(
+                                    "⚠️ **No verified academic or 2025 research sources were found for this request.** "
+                                    "Only indexed or retrieved documents are shown below. No speculative content will be generated."
+                                )
+
+                                # Attempt to show any partial indexed content if available
+                                try:
+                                    fallback_context, fallback_pairs = retrieve_local_then_web(
+                                        prompt,
+                                        top_k_local=max(1, NUM_CTX_KEEP // 2),
+                                        top_k_web=max(1, NUM_CTX_KEEP // 2),
+                                    )
+                                    if fallback_context:
+                                        st.markdown("### Partial Retrieved Context")
+                                        st.text_area("context_preview", fallback_context[:2000], height=300)
+                                        context = (context + ("\n\n---\n\n" if context else "") + fallback_context).strip()
+                                        pairs.extend(fallback_pairs)
+                                except Exception as e:
+                                    print(f"[App] Safe fallback retrieval failed: {e}")
+
+                            # If still nothing factual exists, stop gracefully
+                            if not context:
+                                with st.chat_message("assistant"):
+                                    st.markdown(
+                                        "❌ **No retrievable factual data found.**\n\n"
+                                        "Please upload local files or enable online retrieval to continue."
+                                    )
+                                st.stop()
+
+                        # 6. Proceed to generation ONLY if context exists
+                        if context:
+                            with st.chat_message("assistant"):
+                                placeholder = st.empty()
+                                buf = ""
+                                for part in stream_answer(st.session_state.messages, context):
+                                    buf += part
+                                    placeholder.markdown(buf)
+                                answer_text = buf
+
+
+            # Generation Phase (for search query)
+            with st.chat_message("assistant"):
+                if not _has_sufficient_evidence(context, pairs):
+                    msg = "I don't have enough evidence in the provided sources."
+                    st.markdown(msg)
+                    answer_text = msg
+                else:
+                    placeholder = st.empty()
+                    buf = ""
+                    for part in stream_answer(st.session_state.messages, context):
+                        buf += part
+                        placeholder.markdown(buf)
+                    answer_text = buf
+        # Branch 2: Specialist Handlers
         
+        elif intent == TaskIntent.PROOFREAD:
+            with st.spinner("Proofreading..."):
+                answer_text = proofreader.run_proofreading(
+                    specialist_text,
+                    specialist_llm_call
+                )
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.DRAFT_EMAIL:
+            with st.spinner("Drafting email..."):
+                answer_text = email_drafter.run_email_draft(
+                    specialist_text,
+                    specialist_llm_call
+                )
+            st.chat_message("assistant").markdown(answer_text)
+            
+        # Generic Handlers for other specialist prompts
+        
+        elif intent == TaskIntent.SUMMARIZE:
+            with st.spinner("Summarizing..."):
+                prompt_template = specialist_prompts.get_summarizer_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.ANALYZE:
+            with st.spinner("Analyzing..."):
+                prompt_template = specialist_prompts.get_analyst_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.BRAINSTORM_IDEAS:
+            with st.spinner("Brainstorming..."):
+                prompt_template = specialist_prompts.get_brainstorm_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.GENERATE_CODE:
+            with st.spinner("Generating code..."):
+                prompt_template = specialist_prompts.get_code_generator_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.GENERATE_EXCEL_FORMULA:
+            with st.spinner("Generating formula..."):
+                prompt_template = specialist_prompts.get_excel_formula_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.GENERATE_SQL_QUERY:
+            with st.spinner("Generating SQL..."):
+                prompt_template = specialist_prompts.get_sql_query_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+            
+        elif intent == TaskIntent.GENERATE_REGEX:
+            with st.spinner("Generating regex..."):
+                prompt_template = specialist_prompts.get_regex_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+            
+        elif intent == TaskIntent.SOLVE_MATH:
+            with st.spinner("Solving math problem..."):
+                prompt_template = specialist_prompts.get_math_solver_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+            
+        elif intent == TaskIntent.EXTRACT_INFO:
+            with st.spinner("Extracting info..."):
+                prompt_template = specialist_prompts.get_info_extractor_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        # Handlers for intents without prompts in specialist_prompts.py
+        
+        elif intent == TaskIntent.ELABORATE:
+            with st.spinner("Elaborating..."):
+                prompt_template = "You are a helpful writing assistant. Elaborate on the following text, adding more detail and examples while maintaining the core idea. Return only the expanded text."
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+            
+        elif intent == TaskIntent.CHANGE_TONE:
+            with st.spinner("Changing tone..."):
+                # For this intent, the *original prompt* contains the command
+                # (e.g., "make this professional: [text]")
+                prompt_template = "You are a writing assistant. You rewrite text to match a requested tone. The user will provide the command and the text. Fulfill the request, returning only the rewritten text."
+                # We pass the *original* prompt here, not the stripped one.
+                answer_text = specialist_llm_call(prompt_template, prompt) 
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.TRANSLATE:
+            with st.spinner("Translating..."):
+                # Same as CHANGE_TONE
+                prompt_template = "You are an expert translator. The user will ask to translate text. Fulfill the request, returning only the translated text."
+                # We pass the *original* prompt here.
+                answer_text = specialist_llm_call(prompt_template, prompt)
+            st.chat_message("assistant").markdown(answer_text)
+
         else:
-            # Standard RAG
-            ctx_local, pairs_local = retrieve_local_then_web(
-                prompt,
-                top_k_local=NUM_CTX_KEEP,
-                top_k_web=0,
-            )
-            context = ctx_local
-            pairs = list(pairs_local)
+            # Fallback for any unhandled new intents
+            with st.spinner("Thinking..."):
+                answer_text = specialist_llm_call(
+                    "You are a helpful assistant.",
+                    prompt
+                )
+            st.chat_message("assistant").markdown(answer_text)
 
-            # Optionally, retrieve from the web if not in airplane mode
-            if use_web:
-                with st.spinner("Searching web & enriching context..."):
-                    ymin_p, ymax_p = parse_year_filters(prompt)
-                    year_min, year_max = ymin_p, ymax_p
-                    if st.session_state.get("enable_years", False):
-                        if "year_min" in st.session_state: year_min = int(st.session_state.year_min)
-                        if "year_max" in st.session_state: year_max = int(st.session_state.year_max)
-                    if year_min is not None and year_max is not None and year_min > year_max:
-                        year_min, year_max = year_max, year_min
-                    
-                    # Stage 2 runs inside the needs_search block
-                    safe_query = privacy_expand_query(prompt)
-                    try:
-                        lcoll = get_or_create_collection(COLL_LOCAL)
-                        peek = lcoll.peek(500) or {}
-                        local_docs_seed = []
-                        for docs in (peek.get("documents") or []):
-                            local_docs_seed.extend(docs)
-                    except Exception:
-                        local_docs_seed = []
-                    manager.set_outbound_filter(make_outbound_filter_fn(local_docs_seed))
-
-                    results = search_everything(manager, safe_query, year_min=year_min, year_max=year_max)
-                    url_to_chunks = {}
-                    for rec in results:
-                        body = fetch_page_text(manager, rec["url"]) or ""
-                        meta = "\n\n".join(x for x in [rec.get("title"), rec.get("abstract"), rec.get("url")] if x)
-                        text = (body or meta).strip()
-                        if text:
-                            url_to_chunks.setdefault(rec["url"], []).append(text)
-                    if url_to_chunks:
-                        add_documents(url_to_chunks, target=COLL_WEB)
-
-                    # Retrieve web supplement and append to context
-                    ctx_mixed, pairs_mixed = retrieve_local_then_web(
-                        prompt,
-                        top_k_local=0,
-                        top_k_web=max(1, NUM_CTX_KEEP // 2),
-                    )
-                    if ctx_mixed:
-                        context = (context + ("\n\n---\n\n" if context else "") + ctx_mixed).strip()
-                        pairs.extend(pairs_mixed)
-
-    else:
-        # The LLM decided it can answer directly (e.g., "draft email", "do math").
-        with st.spinner("Thinking..."):
-            pass 
-        context = "" # Explicitly empty context
-        pairs = []
-
-
-# 2. Generation Phase
-# ... (This section remains unchanged) ...
-# # 1. Retrieval Phase
-#     context, pairs = "", []
-#     is_full_summary = st.session_state.answer_depth == "Full Summary (Slow)"
-
-#     if is_full_summary:
-#         # NEW: Map-Reduce Summarization Mode ---
-#         with st.spinner("Starting full summary... This may take several minutes."):
-#             try:
-#                 # 1. Get all unique file sources from the vector store
-#                 lcoll = get_or_create_collection(COLL_LOCAL)
-#                 all_docs = lcoll.get(include=["metadatas"])
-#                 all_sources = sorted(list(set(
-#                     md['source'] for md in all_docs['metadatas'] if md.get('source')
-#                 )))
-                
-#                 if not all_sources:
-#                     st.warning("No local files found to summarize.")
-#                     st.stop()
-
-#                 file_summaries = []
-#                 all_pairs = []
-                
-#                 # 2. "Map" Step: Loop over each file and summarize it
-#                 for source_name in all_sources:
-#                     st.status(f"Summarizing {source_name}...")
-                    
-#                     # a. Create a generic prompt to get key chunks for summarization
-#                     summary_prompt = f"What are the main topics, key points, and conclusions of the document '{source_name}'?"
-                    
-#                     # b. Retrieve chunks *only* from that file
-#                     file_ctx, file_pairs = retrieve_local_then_web(
-#                         summary_prompt,
-#                         top_k_local=NUM_CTX_KEEP, # Use 16 chunks
-#                         top_k_web=0,
-#                         source_filter=source_name  # <-- Use our new filter
-#                     )
-                    
-#                     if not file_ctx:
-#                         continue # Skip empty files or files with no matching chunks
-
-#                     # c. Call Ollama to summarize *just those chunks*
-#                     summary_resp = ollama.chat(
-#                         model=MODEL_GEN,
-#                         messages=[
-#                             {"role": "system", "content": "You are a summarizing assistant. Summarize the key points of the following context. Do not add any preamble or your own opinions. Be factual and concise."},
-#                             {"role": "user", "content": f"Context:\n{file_ctx}\n\nSummary of {source_name}:"}
-#                         ],
-#                         stream=False
-#                     )
-#                     file_summary = summary_resp['message']['content']
-#                     file_summaries.append(f"Summary for {source_name}:\n{file_summary}")
-#                     all_pairs.extend(file_pairs) # Collect all pairs for citation
-
-#                 # 3. "Reduce" Step: Combine all summaries into the final context
-#                 if not file_summaries:
-#                     context = "No relevant information found in local files to summarize."
-#                 else:
-#                     context = "\n\n---\n\n".join(file_summaries)
-#                 pairs = all_pairs
-
-#             except Exception as e:
-#                 st.error(f"Error during full summary: {e}")
-#                 st.stop()
+    except Exception as e:
+        st.error(f"An error occurred during processing: {e}")
+        answer_text = "Sorry, I ran into an error. Please check the logs."
+        st.chat_message("assistant").markdown(answer_text)
     
-#     else:
-#         ctx_local, pairs_local = retrieve_local_then_web(
-#             prompt,
-#             top_k_local=NUM_CTX_KEEP,
-#             top_k_web=0,
-#         )
-#         context = ctx_local
-#         pairs = list(pairs_local)
-
-#         # Optionally, retrieve from the web if not in airplane mode
-#         if use_web:
-#             with st.spinner("Searching web & enriching context..."):
-#                 ymin_p, ymax_p = parse_year_filters(prompt)
-#                 year_min, year_max = ymin_p, ymax_p
-#                 if st.session_state.get("enable_years", False):
-#                     if "year_min" in st.session_state: year_min = int(st.session_state.year_min)
-#                     if "year_max" in st.session_state: year_max = int(st.session_state.year_max)
-#                 if year_min is not None and year_max is not None and year_min > year_max:
-#                     year_min, year_max = year_max, year_min
-                
-#                 safe_query = privacy_expand_query(prompt)
-#                 try:
-#                     lcoll = get_or_create_collection(COLL_LOCAL)
-#                     peek = lcoll.peek(500) or {}
-#                     local_docs_seed = []
-#                     for docs in (peek.get("documents") or []):
-#                         local_docs_seed.extend(docs)
-#                 except Exception:
-#                     local_docs_seed = []
-#                 manager.set_outbound_filter(make_outbound_filter_fn(local_docs_seed))
-
-#                 results = search_everything(manager, safe_query, year_min=year_min, year_max=year_max)
-#                 url_to_chunks = {}
-#                 for rec in results:
-#                     body = fetch_page_text(manager, rec["url"]) or ""
-#                     meta = "\n\n".join(x for x in [rec.get("title"), rec.get("abstract"), rec.get("url")] if x)
-#                     text = (body or meta).strip()
-#                     if text:
-#                         url_to_chunks.setdefault(rec["url"], []).append(text)
-#                 if url_to_chunks:
-#                     add_documents(url_to_chunks, target=COLL_WEB)
-
-#                 # Retrieve web supplement and append to context
-#                 ctx_mixed, pairs_mixed = retrieve_local_then_web(
-#                     prompt,
-#                     top_k_local=0,
-#                     top_k_web=max(1, NUM_CTX_KEEP // 2),
-#                 )
-#                 if ctx_mixed:
-#                     context = (context + ("\n\n---\n\n" if context else "") + ctx_mixed).strip()
-#                     pairs.extend(pairs_mixed)
-
-
-    # 2. Generation Phase
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        buf = ""
-        try:
-            stream = stream_answer(st.session_state.messages, context)
-            for part in stream:
-                buf += part
-                placeholder.markdown(buf)
-        except Exception as e:
-            st.error(f"An error occurred while generating the response: {e}")
-            buf = "Sorry, I ran into an error. Please check the logs."
-
-    answer_text = buf
-
-    # 3. Post-generation Bookkeeping
+    
+    # 7. Post-generation Bookkeeping
     if answer_text:
+        # Store the intent AFTER processing (for next turn's context)
+        st.session_state.last_intent = intent
+        
+        # Add the final answer to the message history
         st.session_state.messages.append({"role": "assistant", "content": answer_text})
-        if pairs:
+        
+        # Only build references if it was a search query (pairs will exist)
+        if intent == TaskIntent.SEARCH_QUERY and pairs:
             refs_md = build_references_by_tags(answer_text, pairs)
             if refs_md.strip():
                 st.markdown(refs_md)
+        
+        # Try to summarize the chat if it's getting long
         maybe_update_summary()
+        
+        # Memory extraction can run for all turns
         if len(st.session_state.messages) >= 2:
             last_user = st.session_state.messages[-2]["content"]
             last_assistant = st.session_state.messages[-1]["content"]
@@ -1164,14 +1617,17 @@ if prompt := st.chat_input("Message"):
                     add_fact(st.session_state.memory, fact_text)
                     prune_memory(st.session_state.memory)
                     save_profile(st.session_state.memory)
+        
+        # Audit logging
         try:
             manager.write_chat_turn(
                 turn_number=len(st.session_state.messages) // 2,
                 user_query=prompt,
                 response_text=answer_text,
-                retrieved_ids=[p[1] for p in pairs] 
+                retrieved_ids=[p[1] for p in pairs] # 'pairs' will be empty unless SEARCH_QUERY
             )
             
+            # Update the session's 'updated_at' timestamp and save
             st.session_state.sessions[cur]["updated_at"] = datetime.now().isoformat()
             save_sessions(st.session_state.sessions)
         except Exception as e:

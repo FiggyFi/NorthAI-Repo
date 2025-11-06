@@ -1,48 +1,39 @@
-# File: retrieval/email_drafter.py
+"""
+email_drafter.py
 
-import os
-import datetime
-from .common import hash_text
+Specialist handler for drafting email communications.
 
-def _sanitize_filename(text: str) -> str:
-    return "".join(c if c.isalnum() or c in ('-', '_') else "_" for c in text)[:40]
+This module orchestrates the email drafting task by loading the
+'get_email_drafter_prompt' and executing the LLM call.
 
-def generate_email_draft(session_id: str, recipient: str, topic: str, body_prompt: str, model, config, manager):
+Future scope:
+- Parse context from email threads.
+- Integrate contact/address book.
+- Add signature blocks.
+"""
+
+# Use a relative import to get prompts from the file in the same directory
+from . import specialist_prompts
+
+def run_email_draft(text_to_draft_from: str, llm_call_function) -> str:
     """
-    Generate and store a local email draft.
-    Works entirely offline using the same AI model pipeline.
+    Runs the email drafting task.
+    
+    Args:
+        text_to_draft_from: The user's prompt (e.g., "email my boss about...")
+        llm_call_function: A callable function for interfacing with the LLM.
+                           This function must accept (system_prompt, user_text).
+    
+    Returns:
+        The drafted email text, formatted with Subject and Body.
     """
-    # Generate text using the local model (or your retrieval pipeline)
-    response = model.generate_email(topic, body_prompt)
-
-    # Construct formatted message
-    now = datetime.datetime.utcnow().isoformat()
-    subject = f"Re: {topic.strip().capitalize()}"
-    draft_text = (
-        f"To: {recipient}\n"
-        f"Subject: {subject}\n"
-        f"Date: {now}\n\n"
-        f"{response}\n\n--\nNorth AI Assistant"
-    )
-
-    # Save draft locally
-    drafts_dir = os.path.join("sessions", session_id, "drafts")
-    os.makedirs(drafts_dir, exist_ok=True)
-    filename = _sanitize_filename(topic) + ".txt"
-    draft_path = os.path.join(drafts_dir, filename)
-    with open(draft_path, "w", encoding="utf-8") as f:
-        f.write(draft_text)
-
-    # Log the event
-    manager.write_audit_log(
-        event_type="email_draft",
-        data={
-            "recipient": recipient,
-            "topic": topic,
-            "response_hash": hash_text(response),
-            "saved_path": draft_path,
-        },
-    )
-
-    print(f"[email_drafter] Saved draft: {draft_path}")
-    return draft_path, draft_text
+    # 1. Retrieve the specialist prompt from the central library.
+    system_prompt = specialist_prompts.get_email_drafter_prompt()
+    
+    # 2. Invoke the LLM with the specified instructions and user text.
+    try:
+        drafted_email = llm_call_function(system_prompt, text_to_draft_from)
+        return drafted_email
+    except Exception as e:
+        print(f"[email_drafter] Error during email drafting: {e}")
+        return "Sorry, I was unable to draft the email."

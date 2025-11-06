@@ -111,13 +111,12 @@ def get_or_create_collection(name: str, persistent=True):
     Returns a Chroma collection that is automatically scoped to the active chat/session.
     Prevents document leakage across sessions.
     """
-    import streamlit as st
     session_id = st.session_state.get("current_session")
     if not session_id:
-        # Fallback: generate one if this is the first run
-        session_id = str(uuid4())
-        st.session_state.session_id = session_id
-
+        # Fallback: This should never happen if init_sessions() ran properly
+        raise RuntimeError(
+            "No active session found. Ensure init_sessions() is called before retrieval."
+        )
     db_path = get_session_db_path(session_id)
     client = chromadb.PersistentClient(
         path=str(db_path),
@@ -247,21 +246,15 @@ def ingest_uploaded(files: list) -> int:
 def retrieve_local_then_web(
     question: str,
     top_k_local: int = 6,
-    top_k_web: int = 3,
-    source_filter: str | None = None  # <-- ADD THIS ARGUMENT
+    top_k_web: int = 6,
+    source_filter: str | None = None,
 ) -> Tuple[str, List[Tuple[str, str, str]]]:
     """
-    Retrieve from LOCAL and WEB separately and return a combined context.
-    
-    Args:
-        question: The user's query.
-        top_k_local: Number of local results to fetch.
-        top_k_web: Number of web results to fetch.
-        source_filter: If provided, filter local results to this source URI.
-    
-    Returns:
-      - context string with L#/W# sections
-      - pairs: [(doc, source_url, 'L1'|'W2'), ...]
+    Return a CONTEXT string with [L#]/[W#] tags + list of (doc, src, tag) pairs.
+
+    - Local and web are queried independently with their own top-k.
+    - Optional source_filter: str substring that must appear in the 'source' metadata
+      to be included (useful for "this file only" summaries).
     """
     model = get_embedder()
     q_emb = model.encode([question], convert_to_numpy=True)
@@ -269,49 +262,40 @@ def retrieve_local_then_web(
     blocks: List[str] = []
     pairs: List[Tuple[str, str, str]] = []
 
-    # LOCAL first (optional)
+    # Local retrieval
     if top_k_local > 0:
         lcoll = get_or_create_collection(COLL_LOCAL)
-        
-        # --- THIS IS THE NEW LOGIC BLOCK ---
-        query_params = {
-            "query_embeddings": q_emb,
-            "n_results": top_k_local
-        }
-        if source_filter:
-            query_params["where"] = {"source": source_filter}
-            
-        try:
-            lres = lcoll.query(**query_params)
-        except Exception as e:
-            print(f"[vector_store] Query failed (filter: {source_filter}): {e}")
-            lres = {}
+        lres = lcoll.query(query_embeddings=q_emb, n_results=int(top_k_local))
         ldocs = lres.get("documents", [[]])[0]
         lmeta = lres.get("metadatas", [[]])[0]
-        for i, (doc, md) in enumerate(zip(ldocs, lmeta), 1):
-            if not doc:
-                continue
+        l_i = 0
+        for md, doc in zip(lmeta, ldocs):
             src = (md or {}).get("source", "")
-            tag = f"L{i}"
+            if source_filter and source_filter not in src:
+                continue
+            l_i += 1
+            tag = f"L{l_i}"
             blocks.append(f"[{tag}] LOCAL Source: {src}\n{doc}")
             pairs.append((doc, src, tag))
 
-    # WEB next (optional)
+    # Web retrieval
     if top_k_web > 0:
         wcoll = get_or_create_collection(COLL_WEB)
-        wres = wcoll.query(query_embeddings=q_emb, n_results=top_k_web)
+        wres = wcoll.query(query_embeddings=q_emb, n_results=int(top_k_web))
         wdocs = wres.get("documents", [[]])[0]
         wmeta = wres.get("metadatas", [[]])[0]
-        for i, (doc, md) in enumerate(zip(wdocs, wmeta), 1):
-            if not doc:
-                continue
+        w_i = 0
+        for md, doc in zip(wmeta, wdocs):
             src = (md or {}).get("source", "")
-            tag = f"W{i}"
+            if source_filter and source_filter not in src:
+                continue
+            w_i += 1
+            tag = f"W{w_i}"
             blocks.append(f"[{tag}] WEB Source: {src}\n{doc}")
             pairs.append((doc, src, tag))
 
-    context = "\n\n---\n\n".join(blocks)
-    return context, pairs
+    return ("\n\n---\n\n".join(blocks)).strip(), pairs
+
 
 def retrieve_all(question: str, top_k: int = 6) -> Tuple[str, List[Tuple[str, str, str]]]:
     """

@@ -25,29 +25,35 @@ CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "contact@north.local")
 BASE_UA = f"NorthAI/1.0 (+mailto:{CONTACT_EMAIL})"
 
 # Shared AES-256 key (used for encrypted cache exports/imports)
-"""WARNING: In production, load this from env instead of hard-coding. Example: os.getenv("APP_AES_KEY", "fallback_value")"""
+# WARNING: In production, load this from env instead of hard-coding.
+# Example: os.getenv("APP_AES_KEY", "fallback_value")
 DEFAULT_AES_KEY = "ZpU7UoUokYfV9T6F0b1RkKXK7u5QY8gP"  # example placeholder
 
 def get_local_encryption_key() -> str:
     """Return the shared AES password used across all distributed builds."""
     return DEFAULT_AES_KEY
 
-# Airplane Mode (Global Runtime State)
+# Offline Mode (Global Runtime State)
 def _env_default_on() -> bool:
-    v = str(os.getenv("AIRPLANE_MODE", "1")).strip().lower()
+    v = str(os.getenv("OFFLINE_MODE", "0")).strip().lower()
     return v in ("1", "true", "yes", "on")
 
-_STATE = {"airplane": _env_default_on()}
+_STATE = {"offline": _env_default_on()}
 
-def set_airplane_mode(flag: bool) -> None:
-    """Called by the UI to flip airplane mode during runtime."""
-    _STATE["airplane"] = bool(flag)
+def set_offline_mode(flag: bool) -> None:
+    """Called by the UI to flip offline mode during runtime."""
+    _STATE["offline"] = bool(flag)
+    # keep env in sync for any legacy readers
+    os.environ["OFFLINE_MODE"] = "1" if flag else "0"
 
-def is_airplane_mode() -> bool:
-    """Read the current runtime airplane mode."""
-    return bool(_STATE["airplane"])
+def is_offline_mode() -> bool:
+    """Read the current runtime offline mode."""
+    return bool(_STATE["offline"])
 
-# Pure Helper Functions (No State)
+def offline_mode_str() -> str:
+    return "ON" if is_offline_mode() else "OFF"
+
+# Helper Functions (No State)
 def unify(title, url, source, authors=None, abstract=None, published=None, doi=None, extra=None):
     return {
         "title": title or "",
@@ -155,8 +161,8 @@ class RetrievalManager:
 
     # HTTP retrieval with guard
     def get(self, url, *, params=None, headers=None, timeout=15, api_name=None):
-        """Centralised GET with airplane-mode guard and outbound sanitization."""
-        if is_airplane_mode():
+        """Centralised GET with offline-mode guard and outbound sanitization."""
+        if is_offline_mode():
             raise RuntimeError("Offline mode active. Network calls are blocked.")
 
         if isinstance(params, dict):

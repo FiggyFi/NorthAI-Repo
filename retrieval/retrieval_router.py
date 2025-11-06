@@ -1,84 +1,109 @@
-# retrieval/router.py
+# file: retrieval/retrieval_router.py  (final, drop-in)
 
-"""
-Query routing for academic and general search sources.
-
-Provides heuristics to classify queries and functions to invoke
-academic, general, or combined search providers with deduplication.
-"""
-
-# Language features
 from __future__ import annotations
 from typing import List, Dict, Optional
-
-# Standard
 import re
 
-# Local modules
-from . import connectors as C
 from .common import RetrievalManager
+from .connectors import (
+    weather_consensus,      # returns List[Dict] of unify(...) records
+    wikipedia_search,
+    gdelt_search,
+    openalex_search, crossref_search, arxiv_search, pubmed_search, europepmc_search,
+    search_duckduckgo,
+)
 
 # Heuristics
+_RX_ACADEMIC = re.compile(r"\b(paper|study|arxiv|doi|journal|citation|benchmark|dataset)\b", re.I)
+_RX_WEATHER  = re.compile(r"\b(weather|forecast|temperature|rain|snow|precip|wind)\b", re.I)
+_RX_NEWS     = re.compile(r"\b(news|headline|breaking|today)\b", re.I)
+
 def looks_academic(q: str) -> bool:
-    # This simple list is now robust, because "creative" queries
-    # will never reach this function.
-    # The 'safe_query' it receives will have keywords like "paper" or "study"
-    # expanded from the privacy layer if they were in local docs.
-    keys = ["paper","arxiv","journal","study","dataset","benchmark","neurips","iclr","acl","cvpr","icml","emnlp"]
-    ql = (q or "").lower()
-    return any(k in ql for k in keys)
+    return bool(_RX_ACADEMIC.search(q or ""))
 
-# Academic search connectors
+def looks_weather(q: str) -> bool:
+    return bool(_RX_WEATHER.search(q or ""))
+
+def looks_news(q: str) -> bool:
+    return bool(_RX_NEWS.search(q or ""))
+
+# ----- Academic search -----
 def search_academic(
-    manager: RetrievalManager, 
-    query: str, 
-    year_min: Optional[int]=None, 
-    year_max: Optional[int]=None
-) -> List[Dict]:
-    out: List[Dict] = []
-    out += C.openalex_search(manager, query, per_page=30, year_min=year_min, year_max=year_max)
-    out += C.crossref_search(manager, query, rows=30,   year_min=year_min, year_max=year_max)
-    out += C.arxiv_search(manager, query,  max_results=50, year_min=year_min, year_max=year_max)
-    out += C.pubmed_search(manager, query)
-    out += C.europepmc_search(manager, query)
-    out += C.biorxiv_medrxiv_search(manager, query)
-    return out
-
-# General search connectors
-def search_general(
     manager: RetrievalManager,
-    query: str
+    query: str,
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
 ) -> List[Dict]:
-    out: List[Dict] = []
-    out += C.search_duckduckgo(manager, query)
-    out += C.wikipedia_search(manager, query)
-    out += C.gdelt_search(manager, query)
-    return out
+    items: List[Dict] = []
+    try: items += openalex_search(manager, query, year_min=year_min, year_max=year_max) or []
+    except Exception: pass
+    try: items += crossref_search(manager, query, year_min=year_min, year_max=year_max) or []
+    except Exception: pass
+    try: items += arxiv_search(manager, query, year_min=year_min, year_max=year_max) or []
+    except Exception: pass
+    try: items += pubmed_search(manager, query) or []
+    except Exception: pass
+    try: items += europepmc_search(manager, query) or []
+    except Exception: pass
+    return items
 
-# Combined search
+# ----- General search -----
+def search_general(manager: RetrievalManager, query: str) -> List[Dict]:
+    items: List[Dict] = []
+
+    # 1) Weather (structured) — use consensus directly; do NOT re-wrap
+    if looks_weather(query):
+        try:
+            wx = weather_consensus(manager, query) or []
+            if wx:
+                return wx  # already authoritative; no need for DDG on weather
+        except Exception:
+            pass
+
+    # 2) Wikipedia (factoid/entity) then GDELT (news)
+    try:
+        wk = wikipedia_search(manager, query) or []
+        if wk: items += wk
+    except Exception:
+        pass
+    if looks_news(query):
+        try:
+            news = gdelt_search(manager, query, max_records=20) or []
+            if news: items += news
+        except Exception:
+            pass
+
+    # 3) Fallback: DDG
+    if not items:
+        try:
+            ddg = search_duckduckgo(manager, query, k=8) or []
+            if ddg: items += ddg
+        except Exception:
+            pass
+
+    return items
+
+# ----- Public entrypoint -----
 def search_everything(
-    manager: RetrievalManager, 
-    query: str, # This is the 'safe_query' from the app
-    year_min: Optional[int]=None, 
-    year_max: Optional[int]=None
+    manager: RetrievalManager,
+    query: str,
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
 ) -> List[Dict]:
-    items = []
+    items: List[Dict] = []
 
-    # --- THIS IS THE CORRECTED STAGE 2 FIX ---
     if looks_academic(query):
-        # Academic query: Search academic sources first, then general web.
         items += search_academic(manager, query, year_min, year_max)
         items += search_general(manager, query)
     else:
-        # General query ("weather") OR Enterprise query ("sales manual"):
-        # Search ONLY the general web.
         items += search_general(manager, query)
-    # --- END OF FIX ---
 
-    # de-dupe by URL
+    # De-duplicate by URL
     seen, uniq = set(), []
     for r in items:
         u = r.get("url")
-        if not u or u in seen: continue
-        seen.add(u); uniq.append(r)
+        if not u or u in seen: 
+            continue
+        seen.add(u)
+        uniq.append(r)
     return uniq
