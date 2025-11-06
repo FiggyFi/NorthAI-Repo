@@ -1,0 +1,28 @@
+﻿# 1. Environment and Virtual Environment
+.venv/
+.env
+
+# 2. Python Caches and Compilation Files
+__pycache__/
+*.pyc
+
+# 3. Streamlit and Application Caches/State
+.streamlit/
+config.toml
+sessions/
+cache_exports/
+
+# 4. Logs and Generated Audit Data (CRITICAL to exclude)
+logs/
+
+# 5. Models, Databases, and Vector Stores (CRITICAL to exclude large files)
+models/
+web_rag_db/
+*.sqlite
+
+# 6. IDE and Operating System Files
+.vscode/
+Installers/
+profiles/
+.DS_Store
+Thumbs.db
