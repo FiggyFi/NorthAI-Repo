@@ -3,6 +3,7 @@
 .env
 __pycache__/
 *.pyc
+*.exe
 
 # 2. APPLICATION CACHES AND LOGS (CRITICAL EXCLUSIONS)
 # Logs and Audit Files
@@ -19,11 +20,19 @@ models/
 
 # Vector Stores and Databases
 web_rag_db/
-*.sqlite # Catches retrieval_cache.sqlite
+
+# Catches retrieval_cache.sqlite
+*.sqlite
 
 # 4. IDE AND OS FILES
 .vscode/
 Installers/ # Installer binaries and downloads
-profiles/    # User-specific configuration profiles
 .DS_Store    # macOS
 Thumbs.db    # Windows
+
+# 5. LOCAL FILES ONLY
+*.docx
+session_id.txt
+FolderContents.txt
+start
+stop
