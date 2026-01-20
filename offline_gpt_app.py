@@ -34,15 +34,15 @@ from vector_store import (
     add_documents,
     get_or_create_collection, 
     retrieve_local_then_web,
-    get_session_db_path,  # ← NEW
+    get_session_db_path,  
     get_embedder,
     delete_collection_for_session,
-    get_session_id,
+    get_session_id, log_collection_counts,
 )
 
-# ChromaDB imports for clear documents functionality
-import chromadb  # ← NEW
-from chromadb.config import Settings  # ← NEW
+# DB
+import chromadb 
+from chromadb.config import Settings  
 
 # App Bootstrap
 from app_bootstrap import assert_prereqs_or_raise, snapshot_items
@@ -60,7 +60,7 @@ import json
 import time
 import uuid
 import re
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -82,7 +82,6 @@ assert_prereqs_or_raise()
 
 # Create the config object once for the whole app
 config = AppConfig()
-
 
 #Constants
 APP_TITLE = "NorthAI"
@@ -119,6 +118,38 @@ IMPERATIVE_VERBS = {
 # Immediately sync runtime offline mode for connectors/common
 set_offline_mode(bool(st.session_state.get("offline_mode", False)))
 
+# Pivot Detection Utilities
+def _extract_location(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b(?:,?\s*(ON|Ontario|CA|US|UK))?", text)
+    return m.group(1).strip() if m else None
+
+def detect_pivot(curr_query: str, last_query: Optional[str]) -> bool:
+    """Returns True if query represents a new semantic topic or city."""
+    if not last_query:
+        return True
+    curr_loc = _extract_location(curr_query)
+    prev_loc = _extract_location(last_query)
+    if curr_loc and prev_loc and curr_loc.lower() != prev_loc.lower():
+        print(f"[Pivot] Location change detected: {prev_loc} → {curr_loc}")
+        return True
+    try:
+        emb = get_embedder()
+        try:
+            e1 = emb.encode(curr_query, convert_to_numpy=True)
+            e2 = emb.encode(last_query, convert_to_numpy=True)
+            sim = float((e1 @ e2.T) / ((e1**2).sum()**0.5 * (e2**2).sum()**0.5))
+        except Exception as inner_e:
+            print(f"[Pivot] Fallback similarity failed: {inner_e}")
+            return False
+        if sim < 0.55:
+            print(f"[Pivot] Semantic drift detected (similarity={sim:.2f})")
+            return True
+    except Exception as e:
+        print(f"[Pivot] Similarity check failed ({e}) — ignoring.")
+    return False
+
 @st.cache_resource
 def preload_models():
     """Load all expensive models and resources once."""
@@ -138,6 +169,8 @@ def preload_models():
             # Show a warning if Ollama isn't running but don't crash
             st.warning(f"Could not pre-load Ollama model '{MODEL_GEN}'. Please ensure Ollama is running. Error: {e}")
     return True
+
+log_collection_counts()
 
 # Display a spinner while pre-loading
 with st.spinner("Warming up the AI engines... This may take a moment."):
@@ -1098,11 +1131,24 @@ if prompt := st.chat_input("Message"):
         
         return False
 
-    # Apply follow-up detection
+    # Follow-up refinement + pivot detection
     if intent == TaskIntent.SEARCH_QUERY:
+        # Detect short follow-up commands like "make it clearer"
         if is_followup_refinement(prompt, st.session_state.last_intent):
             intent = st.session_state.last_intent
-            print(f"[ROUTING] Follow-up detected: reusing {intent.name}")
+            print(f"[ROUTING] Follow-up refinement detected → reusing intent: {intent.name}")
+
+    # Always check for topic/location pivots between searches
+    last_q = st.session_state.get("last_query")
+    need_refresh = detect_pivot(prompt, last_q)
+    st.session_state["force_retrieve"] = need_refresh
+
+    if need_refresh:
+        print(f"[Retrieval] Pivot detected or first query — forcing retrieval for '{prompt[:60]}'")
+        st.session_state["last_query"] = prompt
+    else:
+        print("[Retrieval] Continuing with cached topic context.")
+
     
     # 3. Get the clean text to operate on
     specialist_text = strip_command_from_text(prompt)
@@ -1173,7 +1219,7 @@ if prompt := st.chat_input("Message"):
             if is_full_summary:
                 with st.spinner("Starting full summary... This may take several minutes."):
                     try:
-                        # 1. Get all unique file sources from the vector store
+                        # 1. Get all unique file sources
                         lcoll = get_or_create_collection(COLL_LOCAL)
                         all_docs = lcoll.get(include=["metadatas"])
                         all_sources = sorted(list(set(
@@ -1187,7 +1233,7 @@ if prompt := st.chat_input("Message"):
                         file_summaries = []
                         all_pairs = []
 
-                        # 2. Mapping Step: Loop over each file and summarise it
+                        # 2. Summarize each file individually
                         for source_name in all_sources:
                             st.status(f"Summarizing {source_name}...")
 
@@ -1206,7 +1252,6 @@ if prompt := st.chat_input("Message"):
                             if not file_ctx:
                                 continue
 
-                            # 3. Summarize the retrieved text
                             summary_resp = ollama.chat(
                                 model=MODEL_GEN,
                                 messages=[
@@ -1229,11 +1274,7 @@ if prompt := st.chat_input("Message"):
                             file_summaries.append(f"Summary for {source_name}:\n{file_summary}")
                             all_pairs.extend(file_pairs)
 
-                        # 4. Combine all file summaries
-                        if not file_summaries:
-                            context = "No relevant information found in local files to summarize."
-                        else:
-                            context = "\n\n---\n\n".join(file_summaries)
+                        context = "\n\n---\n\n".join(file_summaries) if file_summaries else ""
                         pairs = all_pairs
 
                     except Exception as e:
@@ -1250,7 +1291,6 @@ if prompt := st.chat_input("Message"):
                 context = ctx_local
                 pairs = list(pairs_local)
 
-                # Precompute filters before calling search functions
                 safe_query = privacy_expand_query(prompt)
                 year_min, year_max = parse_year_filters(prompt)
                 if st.session_state.get("enable_years", False):
@@ -1261,25 +1301,25 @@ if prompt := st.chat_input("Message"):
                 if year_min is not None and year_max is not None and year_min > year_max:
                     year_min, year_max = year_max, year_min
 
-                # Gather local docs for outbound privacy filter
+                # Local-doc outbound filter seeding
                 try:
                     lcoll = get_or_create_collection(COLL_LOCAL)
                     peek = lcoll.peek(500) or {}
-                    local_docs_seed: list[str] = []
+                    local_docs_seed = []
                     for docs in (peek.get("documents") or []):
                         local_docs_seed.extend(docs)
                 except Exception:
                     local_docs_seed = []
 
-                # Optionally, retrieve from the web if not in offline mode
+                # Optional web retrieval
                 if use_web:
-                    is_academic_query = any(keyword in prompt.lower() for keyword in [
+                    is_academic_query = any(k in prompt.lower() for k in [
                         "research", "study", "paper", "journal", "article", "published",
                         "doi", "arxiv", "pubmed", "citation", "literature", "scholar",
                         "peer review", "findings", "methodology",
                     ])
 
-                    results = []  # Initialize once for both branches
+                    results = []
 
                     if is_academic_query:
                         print(f"[App] Academic query detected: {prompt[:50]}...")
@@ -1301,7 +1341,7 @@ if prompt := st.chat_input("Message"):
                                 else:
                                     st.caption("No results from academic databases")
 
-                            # Guaranteed enrichment (cannot fail)
+                            # Enrichment & persistence
                             url_to_chunks = {}
                             for rec in academic_results:
                                 title = rec.get("title") or ""
@@ -1332,7 +1372,6 @@ if prompt := st.chat_input("Message"):
 
                             if url_to_chunks:
                                 add_documents(url_to_chunks, target=COLL_WEB)
-                                print(f"[App] Added {len(url_to_chunks)} academic papers")
 
                             results = academic_results or search_everything(
                                 manager,
@@ -1349,12 +1388,10 @@ if prompt := st.chat_input("Message"):
                                 year_min=year_min,
                                 year_max=year_max,
                             )
-
                     else:
-                        # General web search
                         results = search_everything(manager, safe_query, year_min=year_min, year_max=year_max)
 
-                    # Post-search enrichment (safe path)
+                    # Post-search enrichment
                     with st.spinner("Searching web & enriching context..."):
                         try:
                             if local_docs_seed:
@@ -1364,15 +1401,6 @@ if prompt := st.chat_input("Message"):
 
                             if not results:
                                 results = search_everything(manager, safe_query, year_min=year_min, year_max=year_max)
-
-                            if not results:
-                                try:
-                                    from retrieval.connectors import wikipedia_search
-                                    wiki_results = wikipedia_search(manager, safe_query)
-                                    if isinstance(wiki_results, list):
-                                        results = wiki_results[:3]
-                                except Exception as e:
-                                    print(f"[fallback] Wiki error ignored: {e}")
 
                             url_to_chunks = {}
                             for rec in results:
@@ -1411,91 +1439,36 @@ if prompt := st.chat_input("Message"):
                                 context = (context + ("\n\n---\n\n" if context else "") + ctx_mixed).strip()
                                 pairs.extend(pairs_mixed)
 
-                            with st.status("Retrieval debug", state="complete"):
-                                st.caption(
-                                    f"web_results={len(results)}, added_urls={len(url_to_chunks)}, ctx_chars={len(context or '')}"
-                                )
-
                         except Exception as e:
                             print(f"[App] Post-search enrichment exception ignored: {e}")
                             pass
 
-                        # 5. For academic queries with missing sources, return factual fallback (no hallucination)
-                        if is_academic_query and (not context or not pairs):
-                            with st.chat_message("assistant"):
-                                st.markdown(
-                                    "⚠️ **No verified academic or 2025 research sources were found for this request.** "
-                                    "Only indexed or retrieved documents are shown below. No speculative content will be generated."
-                                )
+                # Generation phase
+                with st.chat_message("assistant"):
+                    if not _has_sufficient_evidence(context, pairs):
+                        msg = "I don't have enough evidence in the provided sources."
+                        st.markdown(msg)
+                        answer_text = msg
+                    else:
+                        placeholder = st.empty()
+                        buf = ""
+                        for part in stream_answer(st.session_state.messages, context):
+                            buf += part
+                            placeholder.markdown(buf)
+                        answer_text = buf
 
-                                # Attempt to show any partial indexed content if available
-                                try:
-                                    fallback_context, fallback_pairs = retrieve_local_then_web(
-                                        prompt,
-                                        top_k_local=max(1, NUM_CTX_KEEP // 2),
-                                        top_k_web=max(1, NUM_CTX_KEEP // 2),
-                                    )
-                                    if fallback_context:
-                                        st.markdown("### Partial Retrieved Context")
-                                        st.text_area("context_preview", fallback_context[:2000], height=300)
-                                        context = (context + ("\n\n---\n\n" if context else "") + fallback_context).strip()
-                                        pairs.extend(fallback_pairs)
-                                except Exception as e:
-                                    print(f"[App] Safe fallback retrieval failed: {e}")
-
-                            # If still nothing factual exists, stop gracefully
-                            if not context:
-                                with st.chat_message("assistant"):
-                                    st.markdown(
-                                        "❌ **No retrievable factual data found.**\n\n"
-                                        "Please upload local files or enable online retrieval to continue."
-                                    )
-                                st.stop()
-
-                        # 6. Proceed to generation ONLY if context exists
-                        if context:
-                            with st.chat_message("assistant"):
-                                placeholder = st.empty()
-                                buf = ""
-                                for part in stream_answer(st.session_state.messages, context):
-                                    buf += part
-                                    placeholder.markdown(buf)
-                                answer_text = buf
-
-
-            # Generation Phase (for search query)
-            with st.chat_message("assistant"):
-                if not _has_sufficient_evidence(context, pairs):
-                    msg = "I don't have enough evidence in the provided sources."
-                    st.markdown(msg)
-                    answer_text = msg
-                else:
-                    placeholder = st.empty()
-                    buf = ""
-                    for part in stream_answer(st.session_state.messages, context):
-                        buf += part
-                        placeholder.markdown(buf)
-                    answer_text = buf
         # Branch 2: Specialist Handlers
-        
+
         elif intent == TaskIntent.PROOFREAD:
             with st.spinner("Proofreading..."):
-                answer_text = proofreader.run_proofreading(
-                    specialist_text,
-                    specialist_llm_call
-                )
+                answer_text = proofreader.run_proofreading(specialist_text, specialist_llm_call)
             st.chat_message("assistant").markdown(answer_text)
 
         elif intent == TaskIntent.DRAFT_EMAIL:
             with st.spinner("Drafting email..."):
-                answer_text = email_drafter.run_email_draft(
-                    specialist_text,
-                    specialist_llm_call
-                )
+                answer_text = email_drafter.run_email_draft(specialist_text, specialist_llm_call)
             st.chat_message("assistant").markdown(answer_text)
-            
-        # Generic Handlers for other specialist prompts
-        
+
         elif intent == TaskIntent.SUMMARIZE:
             with st.spinner("Summarizing..."):
                 prompt_template = specialist_prompts.get_summarizer_prompt()
@@ -1531,52 +1504,89 @@ if prompt := st.chat_input("Message"):
                 prompt_template = specialist_prompts.get_sql_query_prompt()
                 answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
-            
+
         elif intent == TaskIntent.GENERATE_REGEX:
             with st.spinner("Generating regex..."):
                 prompt_template = specialist_prompts.get_regex_prompt()
                 answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
-            
+
         elif intent == TaskIntent.SOLVE_MATH:
             with st.spinner("Solving math problem..."):
                 prompt_template = specialist_prompts.get_math_solver_prompt()
                 answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
-            
+
         elif intent == TaskIntent.EXTRACT_INFO:
             with st.spinner("Extracting info..."):
                 prompt_template = specialist_prompts.get_info_extractor_prompt()
                 answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
 
-        # Handlers for intents without prompts in specialist_prompts.py
-        
-        elif intent == TaskIntent.ELABORATE:
-            with st.spinner("Elaborating..."):
-                prompt_template = "You are a helpful writing assistant. Elaborate on the following text, adding more detail and examples while maintaining the core idea. Return only the expanded text."
+        # NEW SR&ED & TECHNICAL WRITING
+
+        elif intent == TaskIntent.STRUCTURE_TECHNICAL_REPORT:
+            with st.spinner("Structuring technical report..."):
+                prompt_template = specialist_prompts.get_structure_technical_report_prompt()
                 answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
-            
-        elif intent == TaskIntent.CHANGE_TONE:
-            with st.spinner("Changing tone..."):
-                # For this intent, the *original prompt* contains the command
-                # (e.g., "make this professional: [text]")
-                prompt_template = "You are a writing assistant. You rewrite text to match a requested tone. The user will provide the command and the text. Fulfill the request, returning only the rewritten text."
-                # We pass the *original* prompt here, not the stripped one.
-                answer_text = specialist_llm_call(prompt_template, prompt) 
+
+        elif intent == TaskIntent.STRUCTURE_SRED_242_SECTION:
+            with st.spinner("Drafting SR&ED Line 242..."):
+                prompt_template = specialist_prompts.get_structure_sred_242_section_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
 
-        elif intent == TaskIntent.TRANSLATE:
-            with st.spinner("Translating..."):
-                # Same as CHANGE_TONE
-                prompt_template = "You are an expert translator. The user will ask to translate text. Fulfill the request, returning only the translated text."
-                # We pass the *original* prompt here.
-                answer_text = specialist_llm_call(prompt_template, prompt)
+        elif intent == TaskIntent.IDENTIFY_TECHNOLOGICAL_UNCERTAINTIES:
+            with st.spinner("Identifying technological uncertainties..."):
+                prompt_template = specialist_prompts.get_identify_technological_uncertainties_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
             st.chat_message("assistant").markdown(answer_text)
 
+        elif intent == TaskIntent.WRITE_TECHNICAL_JUSTIFICATION:
+            with st.spinner("Writing technical justification..."):
+                prompt_template = specialist_prompts.get_write_technical_justification_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.EXTRACT_TECHNICAL_DETAILS:
+            with st.spinner("Extracting technical details..."):
+                prompt_template = specialist_prompts.get_extract_technical_details_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.IMPROVE_TECHNICAL_CLARITY:
+            with st.spinner("Improving clarity..."):
+                prompt_template = specialist_prompts.get_improve_technical_clarity_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.GENERATE_EXPERIMENT_LOGS:
+            with st.spinner("Generating experiment logs..."):
+                prompt_template = specialist_prompts.get_generate_experiment_logs_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.COMPARE_TECHNICAL_APPROACHES:
+            with st.spinner("Comparing approaches..."):
+                prompt_template = specialist_prompts.get_compare_technical_approaches_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.GENERATE_TIMELINE:
+            with st.spinner("Generating timeline..."):
+                prompt_template = specialist_prompts.get_generate_timeline_prompt()
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        elif intent == TaskIntent.GRADE_CLIENT:
+            with st.spinner("Grading client..."):
+                prompt_template = "You are a client evaluation assistant. Based on the provided criteria and text, assign a clear grade and explain the reasoning."
+                answer_text = specialist_llm_call(prompt_template, specialist_text)
+            st.chat_message("assistant").markdown(answer_text)
+
+        # FINAL FALLBACK
         else:
-            # Fallback for any unhandled new intents
             with st.spinner("Thinking..."):
                 answer_text = specialist_llm_call(
                     "You are a helpful assistant.",
@@ -1584,51 +1594,8 @@ if prompt := st.chat_input("Message"):
                 )
             st.chat_message("assistant").markdown(answer_text)
 
+    # GLOBAL EXCEPTION HANDLER FOR THE ENTIRE DISPATCH BLOCK
     except Exception as e:
         st.error(f"An error occurred during processing: {e}")
         answer_text = "Sorry, I ran into an error. Please check the logs."
         st.chat_message("assistant").markdown(answer_text)
-    
-    
-    # 7. Post-generation Bookkeeping
-    if answer_text:
-        # Store the intent AFTER processing (for next turn's context)
-        st.session_state.last_intent = intent
-        
-        # Add the final answer to the message history
-        st.session_state.messages.append({"role": "assistant", "content": answer_text})
-        
-        # Only build references if it was a search query (pairs will exist)
-        if intent == TaskIntent.SEARCH_QUERY and pairs:
-            refs_md = build_references_by_tags(answer_text, pairs)
-            if refs_md.strip():
-                st.markdown(refs_md)
-        
-        # Try to summarize the chat if it's getting long
-        maybe_update_summary()
-        
-        # Memory extraction can run for all turns
-        if len(st.session_state.messages) >= 2:
-            last_user = st.session_state.messages[-2]["content"]
-            last_assistant = st.session_state.messages[-1]["content"]
-            new_facts = extract_memories_from_turn(last_user, last_assistant)
-            for fact_text in new_facts:
-                if not has_fact_text(st.session_state.memory, fact_text):
-                    add_fact(st.session_state.memory, fact_text)
-                    prune_memory(st.session_state.memory)
-                    save_profile(st.session_state.memory)
-        
-        # Audit logging
-        try:
-            manager.write_chat_turn(
-                turn_number=len(st.session_state.messages) // 2,
-                user_query=prompt,
-                response_text=answer_text,
-                retrieved_ids=[p[1] for p in pairs] # 'pairs' will be empty unless SEARCH_QUERY
-            )
-            
-            # Update the session's 'updated_at' timestamp and save
-            st.session_state.sessions[cur]["updated_at"] = datetime.now().isoformat()
-            save_sessions(st.session_state.sessions)
-        except Exception as e:
-            print(f"[audit_log] Failed to write audit log: {e}")

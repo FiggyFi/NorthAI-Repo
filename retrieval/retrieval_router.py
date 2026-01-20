@@ -56,9 +56,12 @@ def search_general(manager: RetrievalManager, query: str) -> List[Dict]:
         try:
             wx = weather_consensus(manager, query) or []
             if wx:
-                return wx  # already authoritative; no need for DDG on weather
-        except Exception:
-            pass
+                # If we got structured weather data, use it but also allow context fallback
+                items += wx
+            else:
+                print("[DEBUG] Weather consensus empty, falling back to DDG.")
+        except Exception as e:
+            print(f"[DEBUG] weather_consensus error: {e!r}")
 
     # 2) Wikipedia (factoid/entity) then GDELT (news)
     try:

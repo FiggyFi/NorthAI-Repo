@@ -1,8 +1,17 @@
 from pathlib import Path
 import json
+import os
 
-PROFILE_DIR = Path("C:/Users/bharding/OneDrive/NorthAI_Profiles")  # or USB stick / network share
+# Base per-user data dir, consistent with app_bootstrap/vector_store
+LOCAL_DATA_DIR = Path(os.getenv("LOCALAPPDATA")) / "NorthAI"
+LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Profiles & sessions DB under LOCALAPPDATA
+PROFILE_DIR = LOCAL_DATA_DIR / "profiles"
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Where to store the sessions metadata
+_SESSIONS_DB_PATH = PROFILE_DIR / "sessions_db.json"
 
 def list_profiles():
     return [f.stem.replace("profile_", "") for f in PROFILE_DIR.glob("profile_*.json")]
@@ -25,8 +34,6 @@ def save_profile(profile: dict) -> None:
     f.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # Define the single file where all chat sessions will be stored
-_SESSIONS_DB_PATH = PROFILE_DIR / "sessions_db.json"
-
 def load_sessions() -> dict:
     """
     Load the entire sessions dictionary from the 'sessions_db.json' file.

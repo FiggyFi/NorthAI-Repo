@@ -1,28 +1,29 @@
-# 1. Environment and Virtual Environment
+# 1. ENVIRONMENT AND PYTHON ARTIFACTS
 .venv/
 .env
-
-# 2. Python Caches and Compilation Files
 __pycache__/
 *.pyc
 
-# 3. Streamlit and Application Caches/State
+# 2. APPLICATION CACHES AND LOGS (CRITICAL EXCLUSIONS)
+# Logs and Audit Files
+logs/
+
+# Streamlit/App Caches and State
 .streamlit/
-config.toml
 sessions/
 cache_exports/
 
-# 4. Logs and Generated Audit Data (CRITICAL to exclude)
-logs/
-
-# 5. Models, Databases, and Vector Stores (CRITICAL to exclude large files)
+# 3. LARGE MODEL AND DATABASE FILES
+# Large Models
 models/
+
+# Vector Stores and Databases
 web_rag_db/
 *.sqlite # Catches retrieval_cache.sqlite
 
-# 6. IDE and Operating System Files
+# 4. IDE AND OS FILES
 .vscode/
-Installers/ # Installer binaries
+Installers/ # Installer binaries and downloads
 profiles/    # User-specific configuration profiles
-.DS_Store    # macOS system file
-Thumbs.db    # Windows system file
+.DS_Store    # macOS
+Thumbs.db    # Windows

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Iterable, Tuple, List, Dict
 
+
 # ML / Embedding / Vector Store
 import torch
 import chromadb
@@ -43,9 +44,19 @@ from uuid import uuid4
 import shutil
 import streamlit as st
 
-# Paths & constants (fixed)
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = (BASE_DIR / "web_rag_db").resolve()
+
+# Paths & constants
+# Use LOCALAPPDATA instead of program directory
+LOCAL_DATA_DIR = Path(os.getenv("LOCALAPPDATA")) / "NorthAI"
+
+# Ensure required folder(s) exist
+LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = LOCAL_DATA_DIR / "web_rag_db"
+DB_PATH.mkdir(parents=True, exist_ok=True)
+
+BASE_DIR = Path(__file__).resolve().parent  # still used for model loading, etc.
+
 
 # Preferred local embedding folder (override with EMB_MODEL_DIR in .env)
 EMB_MODEL_DIR = Path(
@@ -73,10 +84,29 @@ def get_session_db_path(session_id: str) -> Path:
     return db_path
 
 def get_session_id():
-    sid = st.session_state.get("session_id")
-    if not sid:
-        sid = str(uuid4())
-        st.session_state.session_id = sid
+    """
+    Return a persistent session ID reused across app restarts.
+    Prevents new ChromaDB folders from being created every time
+    the app restarts.
+    """
+    # Store session info in LOCALAPPDATA\NorthAI
+    data_dir = Path(os.getenv("LOCALAPPDATA")) / "NorthAI"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    sid_file = data_dir / "session_id.txt"
+
+    if sid_file.exists():
+        return sid_file.read_text()
+
+    sid = uuid4().hex
+    sid_file.write_text(sid)
+    return sid
+
+    # Otherwise generate and persist a new ID
+    sid = f"chat-{uuid4().hex[:6]}"
+    sid_file.write_text(sid)
+    st.session_state["current_session"] = sid
+    print(f"[DEBUG] Created new persistent session ID: {sid}")
     return sid
 
 def get_embedder():
@@ -106,23 +136,23 @@ def get_chroma_client():
         )
     return _client
 
-def get_or_create_collection(name: str, persistent=True):
+
+def get_or_create_collection(name: str, persistent: bool = True):
     """
-    Returns a Chroma collection that is automatically scoped to the active chat/session.
-    Prevents document leakage across sessions.
+    Returns a Chroma collection tied to the persistent session ID.
+    This ensures web_docs/local_docs are preserved across restarts.
     """
-    session_id = st.session_state.get("current_session")
-    if not session_id:
-        # Fallback: This should never happen if init_sessions() ran properly
-        raise RuntimeError(
-            "No active session found. Ensure init_sessions() is called before retrieval."
-        )
+    session_id = get_session_id()  # always consistent
+
     db_path = get_session_db_path(session_id)
     client = chromadb.PersistentClient(
         path=str(db_path),
         settings=Settings(anonymized_telemetry=False)
     )
-    return client.get_or_create_collection(name)
+
+    coll = client.get_or_create_collection(name)
+    print(f"[DEBUG] Using collection={name}, session={session_id}, path={db_path}")
+    return coll
 
 def delete_collection_for_session(session_id: str):
     """
@@ -142,6 +172,28 @@ def delete_collection_for_session(session_id: str):
 def text_sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+
+
+def _is_meaningful_text(text: str) -> bool:
+    """
+    Return False for boilerplate, redirect, or empty pages.
+    Prevents useless HTML (like 'enable JavaScript') from being embedded.
+    """
+    if not text or not text.strip():
+        return False
+    t = text.lower()
+    bad = [
+        "javascript is turned off",
+        "enable javascript",
+        "enable cookies",
+        "redirecting",
+        "window.location",
+        "cookie consent",
+        "<script",
+        "privacy policy",
+    ]
+    return not any(p in t for p in bad)
+
 def _split_chunks(text: str) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500, chunk_overlap=100,
@@ -154,22 +206,21 @@ def add_documents(url_to_chunks: Dict[str, List[str]], target: str):
     Add new text chunks into either the LOCAL or WEB vector collection.
     Skips duplicates based on SHA1(url+chunk). Assumes upstream parsing/filters.
     """
+    print(f"[DEBUG] Target collection={target}, current_session={st.session_state.get('current_session')}")
+
     coll = get_or_create_collection(target)
     model = get_embedder()
 
     docs, metas, ids = [], [], []
     existing = set()
 
-    # Peek existing hashes for fast de-dupe
-
-    # ...
     try:
         peeked = coll.peek(100000) or {}
     except Exception:
         peeked = {}
 
     if isinstance(peeked, dict) and "metadatas" in peeked:
-        # FIX: Iterate directly over the list of metadata dictionaries
+        # Iterate directly over the list of metadata dictionaries
         for md in peeked.get("metadatas", []):
             if isinstance(md, dict) and md.get("hash"):
                 existing.add(md["hash"])
@@ -182,6 +233,9 @@ def add_documents(url_to_chunks: Dict[str, List[str]], target: str):
             ch = (ch or "").strip()
             if not ch:
                 continue
+            if not _is_meaningful_text(ch):
+                print(f"[DEBUG] Skipping non-meaningful text from {url}")
+                continue
             h = text_sha1(url + ch)
             if h in existing:
                 continue
@@ -189,10 +243,17 @@ def add_documents(url_to_chunks: Dict[str, List[str]], target: str):
             metas.append({"source": url, "hash": h})
             ids.append(f"{url}##{i}")
 
+
     # Upsert batch
     if docs:
+        print(f"[DEBUG] Ingesting {len(docs)} docs into {target}")
+        print(f"[DEBUG] First doc preview: {docs[0][:200]!r}")
+        print(f"[DEBUG] Chroma path: {get_session_db_path(st.session_state.get('current_session'))}")
         embs = model.encode(docs, convert_to_numpy=True, show_progress_bar=False)
         coll.upsert(documents=docs, metadatas=metas, ids=ids, embeddings=embs)
+        # Confirm write location (auto-persistent in Chroma >=0.4) 
+        print(f"[vector_store] Collection persisted automatically at: {get_session_db_path(st.session_state.get('current_session'))}")
+
 
 def ingest_uploaded(files: list) -> int:
     """
@@ -333,3 +394,19 @@ def retrieve_all(question: str, top_k: int = 6) -> Tuple[str, List[Tuple[str, st
         pairs.append((doc, src, tag))
 
     return "\n\n---\n\n".join(blocks), pairs
+
+def log_collection_counts():
+    """Debug helper: show doc counts per collection at startup."""
+    session_id = get_session_id()
+    db_path = get_session_db_path(session_id)
+    client = chromadb.PersistentClient(
+        path=str(db_path),
+        settings=Settings(anonymized_telemetry=False)
+    )
+    for name in [COLL_LOCAL, COLL_WEB]:
+        try:
+            coll = client.get_or_create_collection(name)
+            count = len(coll.peek(100000).get("ids", []))
+            print(f"[Startup] {name}: {count} vectors loaded (path={db_path})")
+        except Exception as e:
+            print(f"[Startup] Could not inspect {name}: {e}")

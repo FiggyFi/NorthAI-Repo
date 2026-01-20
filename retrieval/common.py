@@ -12,7 +12,7 @@ import inspect
 import requests
 import requests_cache
 from dotenv import load_dotenv
-
+from pathlib import Path
 try:
     import pyzipper
     _HAS_PYZIPPER = True
@@ -75,56 +75,41 @@ class AppConfig:
     """Centralizes all application path management."""
 
     def __init__(self):
-        self.log_dir = os.getenv("APP_LOG_DIR", "logs")
-        self.session_dir = os.getenv("APP_SESSION_DIR", "sessions")
-        self.cache_export_dir = os.getenv("APP_CACHE_EXPORT_DIR", "cache_exports")
+        BASE = Path(os.getenv("LOCALAPPDATA") or ".") / "NorthAI"
 
-        # Ensure the base /logs/audit folder exists
-        os.makedirs(os.path.join(self.log_dir, "audit"), exist_ok=True)
-        os.makedirs(self.session_dir, exist_ok=True)
-        os.makedirs(self.cache_export_dir, exist_ok=True)
+        self.log_dir = Path(os.getenv("APP_LOG_DIR", BASE / "logs"))
+        self.session_dir = Path(os.getenv("APP_SESSION_DIR", BASE / "sessions"))
+        self.cache_export_dir = Path(os.getenv("APP_CACHE_EXPORT_DIR", BASE / "cache_exports"))
+
+        (self.log_dir / "audit").mkdir(parents=True, exist_ok=True)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_export_dir.mkdir(parents=True, exist_ok=True)
 
     def get_session_audit_dir(self, session_id: str) -> str:
-        """
-        NEW: Returns the single, unified audit directory for a session.
-        e.g., /logs/audit/chat-123abc/
-        """
-        path = os.path.join(self.log_dir, "audit", session_id)
-        os.makedirs(path, exist_ok=True)
-        return path
+        path = self.log_dir / "audit" / session_id
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
 
     def get_audit_log_path(self, session_id: str) -> str:
-        """
-        Return the audit log file path for a session.
-        This now saves to the unified session folder.
-        """
-        session_dir = self.get_session_audit_dir(session_id)
-        return os.path.join(session_dir, "chat_history.jsonl")
+        return str(Path(self.get_session_audit_dir(session_id)) / "chat_history.jsonl")
 
     def get_session_turn_dir(self, session_id: str) -> str:
-        """
-        Get the directory for storing full chat turns.
-        This now points to the unified session folder.
-        """
-        return self.get_session_audit_dir(session_id)
+        return str(Path(self.get_session_audit_dir(session_id)))
 
     def get_session_cache_path(self, session_id: str) -> str:
-        """Get the path to a session's retrieval cache (base name)."""
-        cache_dir = os.path.join(self.session_dir, session_id)
-        os.makedirs(cache_dir, exist_ok=True)
-        return os.path.join(cache_dir, "retrieval_cache")
+        cache_dir = Path(self.session_dir) / session_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir / "retrieval_cache")
 
     def get_cache_export_path(self, session_id: str) -> str:
-        """Get the destination path for a cache export."""
         filename = f"session_{session_id}_cache.zip"
-        return os.path.join(self.cache_export_dir, filename)
+        return str(Path(self.cache_export_dir) / filename)
 
     def get_prune_log_dir(self) -> str:
-        # This now points to the base /audit/ folder
-        return os.path.join(self.log_dir, "audit")
+        return str(Path(self.log_dir) / "audit")
 
     def get_prune_cache_dir(self) -> str:
-        return self.cache_export_dir
+        return str(self.cache_export_dir)
 
 # Retrieval Manager - Manages retrieval, auditing, and caching for a single session
 class RetrievalManager:

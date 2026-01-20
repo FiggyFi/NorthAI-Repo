@@ -16,12 +16,24 @@ from typing import List, Dict, Optional, Tuple
 import re
 from urllib.parse import urlparse, urlsplit, parse_qs, unquote
 from urllib.robotparser import RobotFileParser
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, UTC
 from zoneinfo import ZoneInfo
 
 # Third-party
-import trafilatura
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
+
+from bs4 import BeautifulSoup
+from lxml.html import fromstring
+from readability import Document
 from ddgs import DDGS
+
+try:
+    from selectolax.parser import HTMLParser
+except ImportError:
+    HTMLParser = None  # graceful degrade
 
 # Local Module
 from .common import unify, is_offline_mode, RetrievalManager
@@ -39,89 +51,150 @@ def _range_bounds(year_min: Optional[int], year_max: Optional[int]) -> Tuple[Opt
     end   = f"{year_max}-12-31" if year_max else None
     return start, end
 
-# Duckduckgo - Refactored for better ddgs library usage
+# Duckduckgo 
 def search_duckduckgo(manager: RetrievalManager, query: str, k: int = 8) -> List[Dict]:
     """
-    Search using the ddgs library (successor to duckduckgo-search).
-    
-    Uses context manager for proper resource cleanup and explicit parameters
-    for more reliable results.
-    
+    Web search via DuckDuckGo using the new `ddgs` library.
+
     Args:
-        manager: RetrievalManager instance for audit logging
-        query: Search query string
-        k: Maximum number of results to return
-    
+        manager: RetrievalManager instance for logging/audit.
+        query: Search query string.
+        k: Max number of results.
+
     Returns:
-        List of unified result dictionaries
+        List of unified search result dictionaries.
+    """
+    if is_offline_mode():
+        print("[DDG] Offline mode - skipping search")
+        return []
+
+    q = manager._guard_text(query or "")
+    if not q:
+        print("[DDG] Empty query after sanitization")
+        return []
+
+    manager.write_audit_log("outbound", {
+        "source": "duckduckgo",
+        "query_preview": q[:100]
+    })
+
+    try:
+        from ddgs import DDGS
+        print(f"[DDG] Searching for: {q[:100]}")
+
+        # ddgs must be used as a context manager for connection cleanup
+        with DDGS() as ddgs:
+            results = list(ddgs.text(q, max_results=k))
+
+        print(f"[DDG] Got {len(results)} raw results")
+
+        if not results:
+            manager.write_audit_log("inbound", {
+                "source": "duckduckgo",
+                "count": 0,
+                "note": "No results returned"
+            })
+            return []
+
+        out: List[Dict] = []
+        for hit in results:
+            # ddgs returns keys: 'title', 'href', 'body'
+            title = (hit.get("title") or "").strip()
+            url = (hit.get("href") or "").strip()
+            body = (hit.get("body") or "").strip()
+
+            if not url or not title:
+                continue
+
+            print(f"[DDG] Found: {title[:60]}... at {url[:50]}")
+            out.append(unify(
+                title=title,
+                url=url,
+                source="duckduckgo",
+                authors=[],
+                abstract=body,
+                published=None
+            ))
+
+        manager.write_audit_log("inbound", {
+            "source": "duckduckgo",
+            "count": len(out),
+            "urls": [r["url"] for r in out[:3]]
+        })
+
+        print(f"[DDG] Successfully parsed {len(out)} results")
+        return out
+
+    except ImportError:
+        err = "The `ddgs` package is missing. Install it via `pip install ddgs`."
+        print(f"[DDG] ERROR: {err}")
+        manager.write_audit_log("inbound", {
+            "source": "duckduckgo", "count": 0, "error": err
+        })
+        return []
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)}"
+        print(f"[DDG] ERROR: {err}")
+        manager.write_audit_log("inbound", {
+            "source": "duckduckgo", "count": 0, "error": err
+        })
+        return []
+
+
+# --- Fallback HTML scraper ---
+def search_duckduckgo_html(manager: RetrievalManager, query: str, k: int = 8) -> List[Dict]:
+    """
+    Backup search if ddgs fails.
+    Uses direct HTML parsing of DuckDuckGo results page.
     """
     if is_offline_mode():
         return []
-    
+
     q = manager._guard_text(query or "")
     if not q:
         return []
-    
-    # Site exclusions for better quality results
-    minus = "-site:youtube.com -site:vimeo.com -site:reddit.com"
-    full_query = f"{q} {minus}".strip()
-    
-    manager.write_audit_log("outbound", {
-        "source": "duckduckgo", 
-        "query_preview": q[:100]
-    })
-    
+
     try:
-        # Use context manager for proper resource cleanup
-        with DDGS() as ddgs:
-            hits = list(ddgs.text(
-                keywords=full_query,
-                max_results=int(k)
+        import re
+        from urllib.parse import quote_plus, unquote
+
+        print(f"[DDG-HTML] Attempting HTML scrape for: {q[:100]}")
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+
+        response = manager.get(url, timeout=10, api_name="duckduckgo-html")
+        html = response.text
+
+        pattern = (
+            r'<a rel="nofollow" class="result__a" href="([^"]+)">'
+            r'([^<]+)</a>.*?<a class="result__snippet" href="[^"]+">([^<]+)</a>'
+        )
+
+        matches = re.findall(pattern, html, re.DOTALL)
+        results = []
+
+        for encoded, title, snippet in matches[:k]:
+            match_url = re.search(r'uddg=([^&]+)', encoded)
+            if not match_url:
+                continue
+            decoded_url = unquote(match_url.group(1))
+
+            results.append(unify(
+                title=title.strip(),
+                url=decoded_url,
+                source="duckduckgo-html",
+                authors=[],
+                abstract=snippet.strip(),
+                published=None
             ))
+
+        print(f"[DDG-HTML] Scraped {len(results)} results")
+        return results
+
     except Exception as e:
-        manager.write_audit_log("inbound", {
-            "source": "duckduckgo", 
-            "count": 0, 
-            "error": str(e)
-        })
+        print(f"[DDG-HTML] Failed: {e}")
         return []
     
-    out: List[Dict] = []
-    for h in hits:
-        # Extract URL - ddgs uses 'href' as the primary field
-        url = h.get("href", "")
-        if not url:
-            continue
-        
-        # Extract title and body/snippet
-        title = h.get("title", "")
-        body = h.get("body", "")
-        
-        # Use title or fallback to body for the title field
-        display_title = title if title else (body if body else "")
-        if not display_title:
-            continue
-        
-        out.append(unify(
-            title=display_title,
-            url=url,
-            source="duckduckgo",
-            authors=[],
-            abstract=body,
-            published=None
-        ))
-    
-    # Log successful results
-    if hits:
-        manager.write_audit_log("inbound", {
-            "source": "duckduckgo", 
-            "count": len(hits), 
-            "urls": [i["url"] for i in out]
-        })
-    
-    return out
-
-
 # News-specific search function
 def search_duckduckgo_news(manager: RetrievalManager, query: str, k: int = 8, timelimit: Optional[str] = None) -> List[Dict]:
     """
@@ -347,25 +420,28 @@ def metno_reduce_day(hourly: dict, tz: ZoneInfo, iso_date: str) -> Optional[dict
         return None
 
 # Weather consensus (Open-Meteo + MET Norway)
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import Optional, List, Dict
+
 def weather_consensus(manager: RetrievalManager, location_text: str, iso_date: Optional[str] = None) -> List[Dict]:
     """
-    Build a high-confidence daily forecast for the location's local 'tomorrow'.
+    Build a high-confidence daily forecast for the requested date.
     Returns a list with a single unified weather record.
     """
     g = openmeteo_geocode(manager, location_text)
     if not g:
         return []
 
-    tzname = g["timezone"] or "UTC"
+    tzname = g.get("timezone") or "UTC"
     try:
         tz = ZoneInfo(tzname)
     except Exception:
         tz = ZoneInfo("UTC")
 
-    # Compute 'tomorrow' in the location's timezone if caller didn't pass a date
     if not iso_date:
-        today_loc = datetime.now(tz).date()
-        iso_date = (today_loc + timedelta(days=1)).isoformat()
+        # Explicitly require date — no default behavior
+        raise ValueError("iso_date must be provided; no default date is assumed.")
 
     lat, lon = g["lat"], g["lon"]
 
@@ -390,10 +466,10 @@ def weather_consensus(manager: RetrievalManager, location_text: str, iso_date: O
         f"{g['display_name']} – {iso_date}: high {tmax:.1f}°C, low {tmin:.1f}°C, "
         f"precipitation {precip:.1f} mm."
     )
-    
+
     url = (om and om.get("url")) or (mn and mn.get("url")) or "https://open-meteo.com/"
-    
-    return [unify(  # <-- Changed to return list
+
+    return [unify(
         title=f"Weather forecast for {g['display_name']}",
         url=url,
         source="weather_consensus",
@@ -401,6 +477,7 @@ def weather_consensus(manager: RetrievalManager, location_text: str, iso_date: O
         abstract=abstract,
         published=iso_date,
     )]
+
 
 # Academic: keyless
 def openalex_search(
@@ -760,23 +837,133 @@ def _robots_allows(url: str, user_agent: str = "*") -> bool:
 
 
 def fetch_page_text(manager: RetrievalManager, url: str, timeout: int = 15) -> str:
+    """
+    Multi-layer HTML text extractor:
+    1. readability-lxml
+    2. selectolax or BeautifulSoup
+    3. trafilatura or fallback reparse
+    """
     if _airgapped():
         return ""
+
     safe_url = manager._guard_text(url or "")
-    if not safe_url or not safe_url.startswith(("http://", "https://")):
+    if not safe_url.startswith(("http://", "https://")) or not _robots_allows(safe_url):
         return ""
-    if not _robots_allows(safe_url):
-        return ""
+
     manager.write_audit_log("outbound", {"source": "fetch_page_text", "url": safe_url})
+
     try:
         r = manager.get(safe_url, timeout=timeout, api_name="html_fetch")
         html = r.text if r.ok else ""
         if not html:
-            manager.write_audit_log("inbound", {"source": "fetch_page_text", "url": safe_url, "bytes": 0, "error": "Empty HTML content"})
+            manager.write_audit_log("inbound", {
+                "source": "fetch_page_text",
+                "url": safe_url,
+                "bytes": 0,
+                "error": "Empty HTML content",
+            })
             return ""
-        txt = (trafilatura.extract(html) or "").strip()
-        manager.write_audit_log("inbound", {"source": "fetch_page_text", "url": safe_url, "bytes": len(txt)})
-        return txt
+
+        text_out = None
+        parser_used = "none"
+
+        # --- Stage 1: readability-lxml ---
+        try:
+            doc = Document(html)
+            cleaned = doc.summary(html_partial=False)
+            tree = fromstring(cleaned)
+            text_out = " ".join(tree.xpath("//text()")).strip()
+            if len(text_out) > 200:
+                parser_used = "readability-lxml"
+                raise StopIteration  # short-circuit to logging
+        except StopIteration:
+            pass
+        except Exception:
+            text_out = None
+
+        # --- Stage 2: selectolax or BeautifulSoup ---
+        if not text_out:
+            if HTMLParser:
+                try:
+                    tree = HTMLParser(html)
+                    text_out = " ".join(
+                        node.text(strip=True)
+                        for node in tree.css("body *")
+                        if node.text(strip=True)
+                    )
+                    if len(text_out) > 50:
+                        parser_used = "selectolax"
+                except Exception:
+                    text_out = None
+
+            if not text_out:
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+                        tag.decompose()
+                    text_out = " ".join(t.strip() for t in soup.stripped_strings)
+                    if len(text_out) > 50:
+                        parser_used = "beautifulsoup"
+                except Exception:
+                    text_out = None
+
+        # --- Stage 3: trafilatura or fallback reparse ---
+        if not text_out or len(text_out) < 200:
+            cleaned = None
+
+            # Try trafilatura first if available
+            if trafilatura:
+                try:
+                    cleaned = trafilatura.extract(
+                        html,
+                        include_comments=False,
+                        include_tables=False,
+                        favor_recall=True
+                    )
+                    if cleaned:
+                        parser_used = "trafilatura"
+                except Exception:
+                    cleaned = None
+
+            # If trafilatura failed, retry readability summary + soup
+            if not cleaned:
+                try:
+                    readable = Document(html).summary()
+                    soup = BeautifulSoup(readable, "lxml")
+                    cleaned = soup.get_text(separator=" ", strip=True)
+                    if cleaned:
+                        parser_used = "readability-fallback"
+                except Exception:
+                    cleaned = None
+
+            # Final fallback: selectolax paragraph extraction
+            if not cleaned and HTMLParser:
+                try:
+                    parser = HTMLParser(html)
+                    paragraphs = [p.text(strip=True) for p in parser.tags("p") if p.text(strip=True)]
+                    if paragraphs:
+                        cleaned = " ".join(paragraphs)
+                        parser_used = "selectolax-fallback"
+                except Exception:
+                    cleaned = None
+
+            if cleaned:
+                text_out = cleaned.strip()
+
+        manager.write_audit_log("inbound", {
+            "source": "fetch_page_text",
+            "url": safe_url,
+            "bytes": len(text_out or ""),
+            "parser": parser_used,
+        })
+
+        return (text_out or "").strip()
+
     except Exception as e:
-        manager.write_audit_log("inbound", {"source": "fetch_page_text", "url": safe_url, "bytes": 0, "error": str(e)})
+        manager.write_audit_log("inbound", {
+            "source": "fetch_page_text",
+            "url": safe_url,
+            "bytes": 0,
+            "error": str(e),
+        })
         return ""
